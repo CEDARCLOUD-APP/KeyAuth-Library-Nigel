@@ -20,6 +20,7 @@
 #include <iostream>
 
 #include <shellapi.h>
+#include <lazy_importer.hpp>
 
 #include <sstream> 
 #include <iomanip> 
@@ -116,7 +117,11 @@ static void harden_process_defaults()
         }
     }
 
-    HeapSetInformation(GetProcessHeap(), HeapEnableTerminationOnCorruption, nullptr, 0);
+    auto fnHeapSetInformation = LI_FN(HeapSetInformation).get();
+    auto fnGetProcessHeap = LI_FN(GetProcessHeap).get();
+    if (fnHeapSetInformation && fnGetProcessHeap) {
+        fnHeapSetInformation(fnGetProcessHeap(), HeapEnableTerminationOnCorruption, nullptr, 0);
+    }
 }
 
 // Security hardening updates applied in auth.* -nigel
@@ -317,7 +322,10 @@ namespace {
         const bool ok = file.good();
 
         // reduce casual discovery of seed artifacts -nigel
-        SetFileAttributesA(filePath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
+        auto fnSetFileAttributesA = LI_FN(SetFileAttributesA).get();
+        if (fnSetFileAttributesA) {
+            fnSetFileAttributesA(filePath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
+        }
 
         if (encryptedBlob.pbData && encryptedBlob.cbData > 0) {
             SecureZeroMemory(encryptedBlob.pbData, encryptedBlob.cbData);
@@ -365,14 +373,20 @@ void KeyAuth::api::init()
     std::thread(runChecks).detach();
     seed = generate_random_number();
     std::atexit([]() { cleanUpSeedData(seed); });
-    CreateThread(0, 0, (LPTHREAD_START_ROUTINE)modify, 0, 0, 0);
+    auto fnCreateThread = LI_FN(CreateThread).get();
+    if (fnCreateThread) {
+        fnCreateThread(nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(modify), nullptr, 0, nullptr);
+    }
     if (!allow_injection_compat()) {
         harden_process_defaults();
     }
 
     if (ownerid.length() != 10)
     {
-        MessageBoxA(0, XorStr("Application Not Setup Correctly. Please Watch Video Linked in main.cpp").c_str(), NULL, MB_ICONERROR);
+        auto fnMessageBoxA = LI_FN(MessageBoxA).get();
+        if (fnMessageBoxA) {
+            fnMessageBoxA(0, XorStr("Application Not Setup Correctly. Please Watch Video Linked in main.cpp").c_str(), NULL, MB_ICONERROR);
+        }
         LI_FN(exit)(0);
     }
 
@@ -388,7 +402,10 @@ void KeyAuth::api::init()
 
     // to ensure people removed secret from main.cpp (some people will forget to)
     if (path.find("https") != std::string::npos) {
-        MessageBoxA(0, XorStr("You forgot to remove \"secret\" from main.cpp. Copy details from ").c_str(), NULL, MB_ICONERROR);
+        auto fnMessageBoxA = LI_FN(MessageBoxA).get();
+        if (fnMessageBoxA) {
+            fnMessageBoxA(0, XorStr("You forgot to remove \"secret\" from main.cpp. Copy details from ").c_str(), NULL, MB_ICONERROR);
+        }
         LI_FN(exit)(0);
     }
 
@@ -396,7 +413,10 @@ void KeyAuth::api::init()
     if (!path.empty()) {
 
         if (!std::filesystem::exists(path)) {
-            MessageBoxA(0, XorStr("File not found. Please make sure the file exists.").c_str(), NULL, MB_ICONERROR);
+            auto fnMessageBoxA = LI_FN(MessageBoxA).get();
+            if (fnMessageBoxA) {
+                fnMessageBoxA(0, XorStr("File not found. Please make sure the file exists.").c_str(), NULL, MB_ICONERROR);
+            }
             LI_FN(exit)(0);
         }
         // get the contents of the file
@@ -407,7 +427,10 @@ void KeyAuth::api::init()
 
         thash = md5_file_hex(path);
         if (thash.empty()) {
-            MessageBoxA(0, XorStr("Failed to hash token file.").c_str(), NULL, MB_ICONERROR);
+            auto fnMessageBoxA = LI_FN(MessageBoxA).get();
+            if (fnMessageBoxA) {
+                fnMessageBoxA(0, XorStr("Failed to hash token file.").c_str(), NULL, MB_ICONERROR);
+            }
             LI_FN(exit)(0);
         }
 
@@ -420,7 +443,10 @@ void KeyAuth::api::init()
     auto response = req(data, url);
 
     if (response == XorStr("KeyAuth_Invalid").c_str()) {
-        MessageBoxA(0, XorStr("Application not found. Please copy strings directly from dashboard.").c_str(), NULL, MB_ICONERROR);
+        auto fnMessageBoxA = LI_FN(MessageBoxA).get();
+        if (fnMessageBoxA) {
+            fnMessageBoxA(0, XorStr("Application not found. Please copy strings directly from dashboard.").c_str(), NULL, MB_ICONERROR);
+        }
         LI_FN(exit)(0);
     }
 
@@ -435,7 +461,10 @@ void KeyAuth::api::init()
 
     if (signature.empty() || signatureTimestamp.empty()) { // used for debug
         std::cerr << "[ERROR] Signature or timestamp is empty. Cannot verify." << std::endl;
-        MessageBoxA(0, "Missing signature headers in response", "KeyAuth", MB_ICONERROR);
+        auto fnMessageBoxA = LI_FN(MessageBoxA).get();
+        if (fnMessageBoxA) {
+            fnMessageBoxA(0, "Missing signature headers in response", "KeyAuth", MB_ICONERROR);
+        }
         exit(99); // Temporary debug exit code
     }
 
