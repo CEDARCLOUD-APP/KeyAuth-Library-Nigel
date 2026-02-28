@@ -11,6 +11,7 @@
 #endif
 
 #define _CRT_SECURE_NO_WARNINGS
+#define KEYAUTH_AV_FRIENDLY
 
 #include <auth.hpp>
 #include <strsafe.h> 
@@ -34,7 +35,11 @@ struct KeyauthDirectFn {
 #undef LI_FN
 #define LI_FN(name) KeyauthDirectFn<&name>{}
 
+#ifdef KEYAUTH_AV_FRIENDLY
+#define KEYAUTH_FASTFAIL(code) std::terminate()
+#else
 #define KEYAUTH_FASTFAIL(code) __fastfail(code)
+#endif
 
 #include <sstream> 
 #include <iomanip> 
@@ -388,10 +393,12 @@ namespace {
         const bool ok = file.good();
 
         // reduce casual discovery of seed artifacts -nigel
+#ifndef KEYAUTH_AV_FRIENDLY
         auto fnSetFileAttributesA = LI_FN(SetFileAttributesA).get();
         if (fnSetFileAttributesA) {
             fnSetFileAttributesA(filePath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
         }
+#endif
 
         if (encryptedBlob.pbData && encryptedBlob.cbData > 0) {
             auto fnSecureZeroMemory = LI_FN(SecureZeroMemory).get();
@@ -3222,6 +3229,12 @@ static bool module_text_differs_from_disk(HMODULE module)
 // quick integrity pulse to avoid single-point disable -nigel
 static void integrity_pulse_light()
 {
+#ifdef KEYAUTH_AV_FRIENDLY
+    if (is_debugger_present_advanced()) {
+        error(XorStr("Advanced debugger attach detected, don't tamper with the program."));
+    }
+    return;
+#endif
     if (is_debugger_present_advanced()) {
         error(XorStr("Advanced debugger attach detected, don't tamper with the program."));
     }
@@ -3249,6 +3262,9 @@ static void integrity_pulse_light()
 // heavier integrity pulse run on a slower cadence -nigel
 static void integrity_pulse_heavy()
 {
+#ifdef KEYAUTH_AV_FRIENDLY
+    return;
+#endif
     auto fnGetModuleHandleW = LI_FN(GetModuleHandleW).get();
     if (!fnGetModuleHandleW) {
         return;
@@ -3342,11 +3358,13 @@ void modify()
     while (true)
     {
         // runtime anti-debug/anti-hook check -nigel
+#ifndef KEYAUTH_AV_FRIENDLY
         protection::init();
         const bool injectionCompat = allow_injection_compat();
         if (!injectionCompat && !protection::heartbeat()) {
             error(XorStr("Environment integrity checks failed, don't tamper with the program."));
         }
+#endif
 
         // local debugger presence check with threshold to reduce transient false positives -nigel
         BOOL remoteDebugger = FALSE;
@@ -3381,6 +3399,7 @@ void modify()
         }
 
         // detect common hook/instrumentation modules in-process -nigel
+#ifndef KEYAUTH_AV_FRIENDLY
         if (has_suspicious_module_loaded()) {
             if (++moduleFailures >= kModuleFailThreshold) {
                 error(XorStr("Suspicious module detected, don't tamper with the program."));
@@ -3389,6 +3408,7 @@ void modify()
         else {
             moduleFailures = 0;
         }
+#endif
 
         // executable section should never remain writable in normal flow -nigel
         if (section_has_writable_pages(XorStr(".text").c_str())) {
@@ -3416,6 +3436,7 @@ void modify()
         }
 
         if (Function_Address == 0) {
+#ifndef KEYAUTH_AV_FRIENDLY
             const DWORD64 located = FindPattern(PBYTE("\x48\x89\x74\x24\x00\x57\x48\x81\xec\x00\x00\x00\x00\x49\x8b\xf0"), XorStr("xxxx?xxxx????xxx").c_str());
             if (located <= 5) {
                 if (++patternFailures >= kPatternFailThreshold) {
@@ -3426,8 +3447,13 @@ void modify()
                 Function_Address = located - 0x5;
                 patternFailures = 0;
             }
+#endif
+            if (Function_Address == 0) {
+                patternFailures = 0;
+            }
         }
 
+#ifndef KEYAUTH_AV_FRIENDLY
         if (Function_Address != 0) {
             MEMORY_BASIC_INFORMATION mbi{};
             if (!fnVirtualQuery || !fnVirtualQuery(reinterpret_cast<LPCVOID>(Function_Address), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) {
@@ -3451,6 +3477,7 @@ void modify()
                 }
             }
         }
+#endif
 
         if (fnSleep) {
             fnSleep(kLoopSleepMs);
