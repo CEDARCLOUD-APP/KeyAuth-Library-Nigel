@@ -895,11 +895,6 @@ void KeyAuth::api::web_login()
         // wprintf(L"    Path: %ws\n", pRequest->CookedUrl.pAbsPath);
         // wprintf(L"    Query: %ws\n", pRequest->CookedUrl.pQueryString);
 
-        std::wstring ws(pRequest->CookedUrl.pQueryString);
-        std::string myVarS = std::string(ws.begin(), ws.end());
-        std::string user = get_str_between_two_str(myVarS, "?user=", "&");
-        std::string token = get_str_between_two_str(myVarS, "&token=", "");
-
         // std::cout << get_str_between_two_str(CW2A(pRequest->CookedUrl.pQueryString), "?", "&") << std::endl;
 
         // break if preflight request from browser
@@ -941,6 +936,23 @@ void KeyAuth::api::web_login()
                 NULL
             );
 
+            delete[]buffer;
+            continue;
+        }
+
+        if (!is_localhost_host(pRequest->CookedUrl.pHost) || !is_loopback_addr(pRequest->Address.pRemoteAddress)) {
+            send_simple_http_response(requestQueueHandle, pRequest, 403, "Forbidden");
+            delete[]buffer;
+            continue;
+        }
+
+        std::wstring ws(pRequest->CookedUrl.pQueryString);
+        std::string myVarS = std::string(ws.begin(), ws.end());
+        std::string user = get_str_between_two_str(myVarS, "?user=", "&");
+        std::string token = get_str_between_two_str(myVarS, "&token=", "");
+
+        if (user.empty() || token.empty() || user.size() > 64 || token.size() > 128) {
+            send_simple_http_response(requestQueueHandle, pRequest, 400, "Bad Request");
             delete[]buffer;
             continue;
         }
@@ -2553,6 +2565,58 @@ static bool section_has_writable_pages(const char* section_name)
     }
 
     return true;
+}
+
+static bool is_localhost_host(const wchar_t* host)
+{
+    if (!host) {
+        return false;
+    }
+    if (_wcsicmp(host, L"localhost") == 0) {
+        return true;
+    }
+    if (_wcsicmp(host, L"127.0.0.1") == 0) {
+        return true;
+    }
+    if (_wcsicmp(host, L"::1") == 0) {
+        return true;
+    }
+    if (_wcsicmp(host, L"[::1]") == 0) {
+        return true;
+    }
+    return false;
+}
+
+static bool is_loopback_addr(const SOCKADDR* addr)
+{
+    if (!addr) {
+        return false;
+    }
+    if (addr->sa_family == AF_INET) {
+        const SOCKADDR_IN* in = reinterpret_cast<const SOCKADDR_IN*>(addr);
+        return in->sin_addr.S_un.S_addr == htonl(INADDR_LOOPBACK);
+    }
+    return false;
+}
+
+static void send_simple_http_response(HANDLE requestQueueHandle, PHTTP_REQUEST pRequest, USHORT status, const char* reason)
+{
+    HTTP_RESPONSE response{};
+    response.StatusCode = status;
+    response.pReason = reason;
+    response.ReasonLength = static_cast<USHORT>(strlen(reason));
+    HttpSendHttpResponse(
+        requestQueueHandle,
+        pRequest->RequestId,
+        0,
+        &response,
+        nullptr,
+        nullptr,
+        nullptr,
+        0,
+        nullptr,
+        nullptr
+    );
 }
 
 void modify()
