@@ -2177,7 +2177,7 @@ auto check_section_integrity(const char* section_name, bool fix = false) -> bool
     auto* mappedSection = IMAGE_FIRST_SECTION(mappedNt);
     bool patched = false;
     char targetSectionName[8] = { 0 };
-    std::memcpy(targetSectionName, section_name, std::min<std::size_t>(8, std::strlen(section_name)));
+    std::memcpy(targetSectionName, section_name, (std::min<std::size_t>)(8, std::strlen(section_name)));
 
     for (WORD i = 0; i < mappedNt->FileHeader.NumberOfSections; ++i, ++loadedSection, ++mappedSection) {
         const bool sectionNameMatch = std::memcmp(loadedSection->Name, targetSectionName, sizeof(targetSectionName)) == 0;
@@ -2541,7 +2541,7 @@ static bool section_has_writable_pages(const char* section_name)
     }
 
     char targetSectionName[8] = { 0 };
-    std::memcpy(targetSectionName, section_name, std::min<std::size_t>(8, std::strlen(section_name)));
+    std::memcpy(targetSectionName, section_name, (std::min<std::size_t>)(8, std::strlen(section_name)));
     auto* section = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
         if (std::memcmp(section->Name, targetSectionName, sizeof(targetSectionName)) != 0) {
