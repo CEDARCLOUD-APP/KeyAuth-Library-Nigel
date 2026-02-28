@@ -89,6 +89,7 @@ std::atomic<bool> LoggedIn(false);
 static bool is_localhost_host(const wchar_t* host);
 static bool is_loopback_addr(const SOCKADDR* addr);
 static void send_simple_http_response(HANDLE requestQueueHandle, PHTTP_REQUEST pRequest, USHORT status, const char* reason);
+static HMODULE ensure_module_loaded(const wchar_t* name);
 
 // optional compatibility toggle for injected/DLL use-cases -nigel
 static bool allow_injection_compat()
@@ -100,18 +101,34 @@ static bool allow_injection_compat()
 #endif
 }
 
+static HMODULE ensure_module_loaded(const wchar_t* name)
+{
+    // lazy module loader for import hiding -nigel
+    auto fnGetModuleHandleW = LI_FN(GetModuleHandleW).get();
+    auto fnLoadLibraryW = LI_FN(LoadLibraryW).get();
+    HMODULE mod = nullptr;
+    if (fnGetModuleHandleW) {
+        mod = fnGetModuleHandleW(name);
+    }
+    if (!mod && fnLoadLibraryW) {
+        mod = fnLoadLibraryW(name);
+    }
+    return mod;
+}
+
 static void harden_process_defaults()
 {
     // harden dll search path and heap corruption behavior without API changes -nigel
-    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (kernel32) {
+    HMODULE kernel32 = ensure_module_loaded(L"kernel32.dll");
+    auto fnGetProcAddress = LI_FN(GetProcAddress).get();
+    if (kernel32 && fnGetProcAddress) {
         auto set_default_dirs = reinterpret_cast<BOOL(WINAPI*)(DWORD)>(
-            GetProcAddress(kernel32, "SetDefaultDllDirectories"));
+            fnGetProcAddress(kernel32, "SetDefaultDllDirectories"));
         if (set_default_dirs) {
             set_default_dirs(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
         }
         auto set_dll_dir = reinterpret_cast<BOOL(WINAPI*)(LPCWSTR)>(
-            GetProcAddress(kernel32, "SetDllDirectoryW"));
+            fnGetProcAddress(kernel32, "SetDllDirectoryW"));
         if (set_dll_dir) {
             set_dll_dir(L"");
         }
@@ -192,6 +209,19 @@ namespace {
 
     // in-process hashing to avoid certutil/_popen shell execution -nigel
     std::string md5_file_hex(const std::string& filePath) {
+        ensure_module_loaded(L"bcrypt.dll");
+        // resolve bcrypt via lazy imports for import hiding -nigel
+        auto fnBCryptOpenAlgorithmProvider = LI_FN(BCryptOpenAlgorithmProvider).get();
+        auto fnBCryptGetProperty = LI_FN(BCryptGetProperty).get();
+        auto fnBCryptCreateHash = LI_FN(BCryptCreateHash).get();
+        auto fnBCryptHashData = LI_FN(BCryptHashData).get();
+        auto fnBCryptFinishHash = LI_FN(BCryptFinishHash).get();
+        auto fnBCryptDestroyHash = LI_FN(BCryptDestroyHash).get();
+        auto fnBCryptCloseAlgorithmProvider = LI_FN(BCryptCloseAlgorithmProvider).get();
+        if (!fnBCryptOpenAlgorithmProvider || !fnBCryptGetProperty || !fnBCryptCreateHash ||
+            !fnBCryptHashData || !fnBCryptFinishHash || !fnBCryptDestroyHash || !fnBCryptCloseAlgorithmProvider) {
+            return "";
+        }
         BCRYPT_ALG_HANDLE algHandle = nullptr;
         BCRYPT_HASH_HANDLE hashHandle = nullptr;
         std::vector<unsigned char> hashObject;
@@ -205,29 +235,29 @@ namespace {
             return "";
         }
 
-        NTSTATUS status = BCryptOpenAlgorithmProvider(&algHandle, BCRYPT_MD5_ALGORITHM, nullptr, 0);
+        NTSTATUS status = fnBCryptOpenAlgorithmProvider(&algHandle, BCRYPT_MD5_ALGORITHM, nullptr, 0);
         if (status < 0) {
             return "";
         }
 
-        status = BCryptGetProperty(algHandle, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength), &cbResult, 0);
+        status = fnBCryptGetProperty(algHandle, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength), &cbResult, 0);
         if (status < 0 || objectLength == 0) {
-            BCryptCloseAlgorithmProvider(algHandle, 0);
+            fnBCryptCloseAlgorithmProvider(algHandle, 0);
             return "";
         }
 
-        status = BCryptGetProperty(algHandle, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashLength), sizeof(hashLength), &cbResult, 0);
+        status = fnBCryptGetProperty(algHandle, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashLength), sizeof(hashLength), &cbResult, 0);
         if (status < 0 || hashLength == 0) {
-            BCryptCloseAlgorithmProvider(algHandle, 0);
+            fnBCryptCloseAlgorithmProvider(algHandle, 0);
             return "";
         }
 
         hashObject.resize(objectLength);
         hashOutput.resize(hashLength);
 
-        status = BCryptCreateHash(algHandle, &hashHandle, hashObject.data(), objectLength, nullptr, 0, 0);
+        status = fnBCryptCreateHash(algHandle, &hashHandle, hashObject.data(), objectLength, nullptr, 0, 0);
         if (status < 0) {
-            BCryptCloseAlgorithmProvider(algHandle, 0);
+            fnBCryptCloseAlgorithmProvider(algHandle, 0);
             return "";
         }
 
@@ -236,18 +266,18 @@ namespace {
             file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
             const std::streamsize bytesRead = file.gcount();
             if (bytesRead > 0) {
-                status = BCryptHashData(hashHandle, reinterpret_cast<PUCHAR>(buffer.data()), static_cast<ULONG>(bytesRead), 0);
+                status = fnBCryptHashData(hashHandle, reinterpret_cast<PUCHAR>(buffer.data()), static_cast<ULONG>(bytesRead), 0);
                 if (status < 0) {
-                    BCryptDestroyHash(hashHandle);
-                    BCryptCloseAlgorithmProvider(algHandle, 0);
+                    fnBCryptDestroyHash(hashHandle);
+                    fnBCryptCloseAlgorithmProvider(algHandle, 0);
                     return "";
                 }
             }
         }
 
-        status = BCryptFinishHash(hashHandle, hashOutput.data(), hashLength, 0);
-        BCryptDestroyHash(hashHandle);
-        BCryptCloseAlgorithmProvider(algHandle, 0);
+        status = fnBCryptFinishHash(hashHandle, hashOutput.data(), hashLength, 0);
+        fnBCryptDestroyHash(hashHandle);
+        fnBCryptCloseAlgorithmProvider(algHandle, 0);
         if (status < 0) {
             return "";
         }
@@ -276,18 +306,23 @@ namespace {
         CRYPTPROTECT_PROMPTSTRUCT* prompt, DWORD flags, DATA_BLOB* out)
     {
 #ifdef KEYAUTH_DYNAMIC_IMPORTS
-        static HMODULE crypt32 = LoadLibraryW(L"crypt32.dll");
+        static HMODULE crypt32 = ensure_module_loaded(L"crypt32.dll");
         if (!crypt32) {
             return false;
         }
         using CryptProtectDataFn = BOOL(WINAPI*)(DATA_BLOB*, LPCWSTR, DATA_BLOB*, PVOID, CRYPTPROTECT_PROMPTSTRUCT*, DWORD, DATA_BLOB*);
-        auto fn = reinterpret_cast<CryptProtectDataFn>(GetProcAddress(crypt32, "CryptProtectData"));
+        auto fnGetProcAddress = LI_FN(GetProcAddress).get();
+        auto fn = fnGetProcAddress ? reinterpret_cast<CryptProtectDataFn>(fnGetProcAddress(crypt32, "CryptProtectData")) : nullptr;
         if (!fn) {
             return false;
         }
         return fn(in, desc, optionalEntropy, reserved, prompt, flags, out) != FALSE;
 #else
-        return CryptProtectData(in, desc, optionalEntropy, reserved, prompt, flags, out) != FALSE;
+        auto fn = LI_FN(CryptProtectData).get();
+        if (!fn) {
+            return false;
+        }
+        return fn(in, desc, optionalEntropy, reserved, prompt, flags, out) != FALSE;
 #endif
     }
 
@@ -309,10 +344,19 @@ namespace {
         std::ofstream file(filePath, std::ios::binary | std::ios::trunc);
         if (!file.is_open()) {
             if (encryptedBlob.pbData && encryptedBlob.cbData > 0) {
-                SecureZeroMemory(encryptedBlob.pbData, encryptedBlob.cbData);
+                auto fnSecureZeroMemory = LI_FN(SecureZeroMemory).get();
+                if (fnSecureZeroMemory) {
+                    fnSecureZeroMemory(encryptedBlob.pbData, encryptedBlob.cbData);
+                }
+                else {
+                    std::memset(encryptedBlob.pbData, 0, encryptedBlob.cbData);
+                }
             }
             if (encryptedBlob.pbData) {
-                LocalFree(encryptedBlob.pbData);
+                auto fnLocalFree = LI_FN(LocalFree).get();
+                if (fnLocalFree) {
+                    fnLocalFree(encryptedBlob.pbData);
+                }
             }
             return false;
         }
@@ -328,13 +372,28 @@ namespace {
         }
 
         if (encryptedBlob.pbData && encryptedBlob.cbData > 0) {
-            SecureZeroMemory(encryptedBlob.pbData, encryptedBlob.cbData);
+            auto fnSecureZeroMemory = LI_FN(SecureZeroMemory).get();
+            if (fnSecureZeroMemory) {
+                fnSecureZeroMemory(encryptedBlob.pbData, encryptedBlob.cbData);
+            }
+            else {
+                std::memset(encryptedBlob.pbData, 0, encryptedBlob.cbData);
+            }
         }
         if (encryptedBlob.pbData) {
-            LocalFree(encryptedBlob.pbData);
+            auto fnLocalFree = LI_FN(LocalFree).get();
+            if (fnLocalFree) {
+                fnLocalFree(encryptedBlob.pbData);
+            }
         }
         if (!plaintextBuffer.empty()) {
-            SecureZeroMemory(plaintextBuffer.data(), plaintextBuffer.size());
+            auto fnSecureZeroMemory = LI_FN(SecureZeroMemory).get();
+            if (fnSecureZeroMemory) {
+                fnSecureZeroMemory(plaintextBuffer.data(), plaintextBuffer.size());
+            }
+            else {
+                std::memset(plaintextBuffer.data(), 0, plaintextBuffer.size());
+            }
         }
 
         return ok;
@@ -370,6 +429,8 @@ namespace {
 
 void KeyAuth::api::init()
 {
+    ensure_module_loaded(L"user32.dll");
+    ensure_module_loaded(L"shell32.dll");
     std::thread(runChecks).detach();
     seed = generate_random_number();
     std::atexit([]() { cleanUpSeedData(seed); });
@@ -490,7 +551,10 @@ void KeyAuth::api::init()
             if (json[(XorStr("success"))])
             {
                 if (json[(XorStr("newSession"))]) {
-                    Sleep(100);
+                    auto fnSleep = LI_FN(Sleep).get();
+                    if (fnSleep) {
+                        fnSleep(100);
+                    }
                 }
                 sessionid = json[(XorStr("sessionid"))];
                 initialized.store(true);
@@ -502,11 +566,17 @@ void KeyAuth::api::init()
                 api::app_data.downloadLink = json[XorStr("download")];
                 if (dl == "")
                 {
-                    MessageBoxA(0, XorStr("Version in the loader does match the one on the dashboard, and the download link on dashboard is blank.\n\nTo fix this, either fix the loader so it matches the version on the dashboard. Or if you intended for it to have different versions, update the download link on dashboard so it will auto-update correctly.").c_str(), NULL, MB_ICONERROR);
+                    auto fnMessageBoxA = LI_FN(MessageBoxA).get();
+                    if (fnMessageBoxA) {
+                        fnMessageBoxA(0, XorStr("Version in the loader does match the one on the dashboard, and the download link on dashboard is blank.\n\nTo fix this, either fix the loader so it matches the version on the dashboard. Or if you intended for it to have different versions, update the download link on dashboard so it will auto-update correctly.").c_str(), NULL, MB_ICONERROR);
+                    }
                 }
                 else
                 {
-                    ShellExecuteA(0, XorStr("open").c_str(), dl.c_str(), 0, 0, SW_SHOWNORMAL);
+                    auto fnShellExecuteA = LI_FN(ShellExecuteA).get();
+                    if (fnShellExecuteA) {
+                        fnShellExecuteA(0, XorStr("open").c_str(), dl.c_str(), 0, 0, SW_SHOWNORMAL);
+                    }
                 }
                 LI_FN(exit)(0);
             }
@@ -789,7 +859,11 @@ void KeyAuth::api::Tfa::handleInput(KeyAuth::api& instance) {
     if (instance.activate) {
         QrCode();
 
-        ShellExecuteA(0, XorStr("open").c_str(), XorStr("QRCode.png").c_str(), 0, 0, SW_SHOWNORMAL);
+        ensure_module_loaded(L"shell32.dll");
+        auto fnShellExecuteA = LI_FN(ShellExecuteA).get();
+        if (fnShellExecuteA) {
+            fnShellExecuteA(0, XorStr("open").c_str(), XorStr("QRCode.png").c_str(), 0, 0, SW_SHOWNORMAL);
+        }
 
         system("cls");
         std::cout << XorStr("Press enter when you have scanned the QR code");
@@ -825,87 +899,132 @@ void KeyAuth::api::Tfa::handleInput(KeyAuth::api& instance) {
 void KeyAuth::api::web_login()
 {
     checkInit();
+    ensure_module_loaded(L"httpapi.dll");
+    ensure_module_loaded(L"user32.dll");
+
+    // lazy-resolve httpapi/user32 imports to hide iat -nigel
+    auto fnMessageBoxA = LI_FN(MessageBoxA).get();
+    auto fnHttpInitialize = LI_FN(HttpInitialize).get();
+    auto fnHttpCreateServerSession = LI_FN(HttpCreateServerSession).get();
+    auto fnHttpCreateUrlGroup = LI_FN(HttpCreateUrlGroup).get();
+    auto fnHttpCreateRequestQueue = LI_FN(HttpCreateRequestQueue).get();
+    auto fnHttpSetUrlGroupProperty = LI_FN(HttpSetUrlGroupProperty).get();
+    auto fnHttpAddUrlToUrlGroup = LI_FN(HttpAddUrlToUrlGroup).get();
+    auto fnHttpReceiveHttpRequest = LI_FN(HttpReceiveHttpRequest).get();
+    auto fnHttpSendHttpResponse = LI_FN(HttpSendHttpResponse).get();
+    if (!fnHttpInitialize || !fnHttpCreateServerSession || !fnHttpCreateUrlGroup ||
+        !fnHttpCreateRequestQueue || !fnHttpSetUrlGroupProperty || !fnHttpAddUrlToUrlGroup ||
+        !fnHttpReceiveHttpRequest || !fnHttpSendHttpResponse) {
+        error(XorStr("Http API functions unavailable."));
+        return;
+    }
 
     // from https://perpetualprogrammers.wordpress.com/2016/05/22/the-http-server-api/
 
     // Initialize the API.
     ULONG result = 0;
     HTTPAPI_VERSION version = HTTPAPI_VERSION_2;
-    result = HttpInitialize(version, HTTP_INITIALIZE_SERVER, 0);
+    result = fnHttpInitialize(version, HTTP_INITIALIZE_SERVER, 0);
 
     if (result == ERROR_INVALID_PARAMETER) {
-        MessageBoxA(NULL, "The Flags parameter contains an unsupported value.", "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, "The Flags parameter contains an unsupported value.", "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
     if (result != NO_ERROR) {
-        MessageBoxA(NULL, "System error for Initialize", "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, "System error for Initialize", "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     // Create server session.
     HTTP_SERVER_SESSION_ID serverSessionId;
-    result = HttpCreateServerSession(version, &serverSessionId, 0);
+    result = fnHttpCreateServerSession(version, &serverSessionId, 0);
 
     if (result == ERROR_REVISION_MISMATCH) {
-        MessageBoxA(NULL, "Version for session invalid", "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, "Version for session invalid", "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     if (result == ERROR_INVALID_PARAMETER) {
-        MessageBoxA(NULL, "pServerSessionId parameter is null", "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, "pServerSessionId parameter is null", "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     if (result != NO_ERROR) {
-        MessageBoxA(NULL, "System error for HttpCreateServerSession", "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, "System error for HttpCreateServerSession", "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     // Create URL group.
     HTTP_URL_GROUP_ID groupId;
-    result = HttpCreateUrlGroup(serverSessionId, &groupId, 0);
+    result = fnHttpCreateUrlGroup(serverSessionId, &groupId, 0);
 
     if (result == ERROR_INVALID_PARAMETER) {
-        MessageBoxA(NULL, "Url group create parameter error", "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, "Url group create parameter error", "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     if (result != NO_ERROR) {
-        MessageBoxA(NULL, "System error for HttpCreateUrlGroup", "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, "System error for HttpCreateUrlGroup", "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     // Create request queue.
     HANDLE requestQueueHandle;
-    result = HttpCreateRequestQueue(version, NULL, NULL, 0, &requestQueueHandle);
+    result = fnHttpCreateRequestQueue(version, NULL, NULL, 0, &requestQueueHandle);
 
     if (result == ERROR_REVISION_MISMATCH) {
-        MessageBoxA(NULL, "Wrong version", "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, "Wrong version", "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     if (result == ERROR_INVALID_PARAMETER) {
-        MessageBoxA(NULL, "Byte length exceeded", "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, "Byte length exceeded", "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     if (result == ERROR_ALREADY_EXISTS) {
-        MessageBoxA(NULL, "pName already used", "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, "pName already used", "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     if (result == ERROR_ACCESS_DENIED) {
-        MessageBoxA(NULL, "queue access denied", "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, "queue access denied", "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     if (result == ERROR_DLL_INIT_FAILED) {
-        MessageBoxA(NULL, "Initialize not called", "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, "Initialize not called", "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     if (result != NO_ERROR) {
-        MessageBoxA(NULL, "System error for HttpCreateRequestQueue", "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, "System error for HttpCreateRequestQueue", "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
@@ -913,44 +1032,58 @@ void KeyAuth::api::web_login()
     HTTP_BINDING_INFO info;
     info.Flags.Present = 1;
     info.RequestQueueHandle = requestQueueHandle;
-    result = HttpSetUrlGroupProperty(groupId, HttpServerBindingProperty, &info, sizeof(info));
+    result = fnHttpSetUrlGroupProperty(groupId, HttpServerBindingProperty, &info, sizeof(info));
 
     if (result == ERROR_INVALID_PARAMETER) {
-        MessageBoxA(NULL, XorStr("Invalid parameter").c_str(), "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, XorStr("Invalid parameter").c_str(), "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     if (result != NO_ERROR) {
-        MessageBoxA(NULL, XorStr("System error for HttpSetUrlGroupProperty").c_str(), "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, XorStr("System error for HttpSetUrlGroupProperty").c_str(), "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     // Add URLs to URL group.
     PCWSTR url = L"http://localhost:1337/handshake";
-    result = HttpAddUrlToUrlGroup(groupId, url, 0, 0);
+    result = fnHttpAddUrlToUrlGroup(groupId, url, 0, 0);
 
     if (result == ERROR_ACCESS_DENIED) {
-        MessageBoxA(NULL, XorStr("No permissions to run web server").c_str(), "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, XorStr("No permissions to run web server").c_str(), "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     if (result == ERROR_ALREADY_EXISTS) {
-        MessageBoxA(NULL, XorStr("You are running this program already").c_str(), "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, XorStr("You are running this program already").c_str(), "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     if (result == ERROR_INVALID_PARAMETER) {
-        MessageBoxA(NULL, XorStr("ERROR_INVALID_PARAMETER for HttpAddUrlToUrlGroup").c_str(), "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, XorStr("ERROR_INVALID_PARAMETER for HttpAddUrlToUrlGroup").c_str(), "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     if (result == ERROR_SHARING_VIOLATION) {
-        MessageBoxA(NULL, XorStr("Another program is using the webserver. Close Razer Chroma mouse software if you use that. Try to restart computer.").c_str(), "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, XorStr("Another program is using the webserver. Close Razer Chroma mouse software if you use that. Try to restart computer.").c_str(), "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
     if (result != NO_ERROR) {
-        MessageBoxA(NULL, XorStr("System error for HttpAddUrlToUrlGroup").c_str(), "Error", MB_ICONEXCLAMATION);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(NULL, XorStr("System error for HttpAddUrlToUrlGroup").c_str(), "Error", MB_ICONEXCLAMATION);
+        }
         LI_FN(exit)(0);
     }
 
@@ -968,9 +1101,9 @@ void KeyAuth::api::web_login()
         int requestSize = sizeof(HTTP_REQUEST) + bufferSize;
         BYTE* buffer = new BYTE[requestSize];
         PHTTP_REQUEST pRequest = (PHTTP_REQUEST)buffer;
-        RtlZeroMemory(buffer, requestSize);
+        std::memset(buffer, 0, static_cast<std::size_t>(requestSize));
         ULONG bytesReturned;
-        result = HttpReceiveHttpRequest(
+        result = fnHttpReceiveHttpRequest(
             requestQueueHandle,
             requestId,
             HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY,
@@ -992,7 +1125,7 @@ void KeyAuth::api::web_login()
         {
             // Respond to the request.
             HTTP_RESPONSE response;
-            RtlZeroMemory(&response, sizeof(response));
+            std::memset(&response, 0, sizeof(response));
 
             response.StatusCode = 200;
             response.pReason = static_cast<PCSTR>(XorStr("OK").c_str());
@@ -1013,7 +1146,7 @@ void KeyAuth::api::web_login()
             HTTP_DATA_CHUNK dataChunk;
             dataChunk.DataChunkType = HttpDataChunkFromMemory;
 
-            result = HttpSendHttpResponse(
+            result = fnHttpSendHttpResponse(
                 requestQueueHandle,
                 pRequest->RequestId,
                 0,
@@ -1101,7 +1234,7 @@ void KeyAuth::api::web_login()
 
                 // Respond to the request.
                 HTTP_RESPONSE response;
-                RtlZeroMemory(&response, sizeof(response));
+                std::memset(&response, 0, sizeof(response));
 
                 bool success = true;
                 if (json[(XorStr("success"))])
@@ -1137,7 +1270,7 @@ void KeyAuth::api::web_login()
                 HTTP_DATA_CHUNK dataChunk;
                 dataChunk.DataChunkType = HttpDataChunkFromMemory;
 
-                result = HttpSendHttpResponse(
+                result = fnHttpSendHttpResponse(
                     requestQueueHandle,
                     pRequest->RequestId,
                     0,
@@ -1172,38 +1305,55 @@ void KeyAuth::api::web_login()
 void KeyAuth::api::button(std::string button)
 {
     checkInit();
+    ensure_module_loaded(L"httpapi.dll");
+
+    // lazy-resolve httpapi imports to hide iat -nigel
+    auto fnHttpInitialize = LI_FN(HttpInitialize).get();
+    auto fnHttpCreateServerSession = LI_FN(HttpCreateServerSession).get();
+    auto fnHttpCreateUrlGroup = LI_FN(HttpCreateUrlGroup).get();
+    auto fnHttpCreateRequestQueue = LI_FN(HttpCreateRequestQueue).get();
+    auto fnHttpSetUrlGroupProperty = LI_FN(HttpSetUrlGroupProperty).get();
+    auto fnHttpAddUrlToUrlGroup = LI_FN(HttpAddUrlToUrlGroup).get();
+    auto fnHttpReceiveHttpRequest = LI_FN(HttpReceiveHttpRequest).get();
+    auto fnHttpSendHttpResponse = LI_FN(HttpSendHttpResponse).get();
+    if (!fnHttpInitialize || !fnHttpCreateServerSession || !fnHttpCreateUrlGroup ||
+        !fnHttpCreateRequestQueue || !fnHttpSetUrlGroupProperty || !fnHttpAddUrlToUrlGroup ||
+        !fnHttpReceiveHttpRequest || !fnHttpSendHttpResponse) {
+        error(XorStr("Http API functions unavailable."));
+        return;
+    }
 
     // from https://perpetualprogrammers.wordpress.com/2016/05/22/the-http-server-api/
 
     // Initialize the API.
     ULONG result = 0;
     HTTPAPI_VERSION version = HTTPAPI_VERSION_2;
-    result = HttpInitialize(version, HTTP_INITIALIZE_SERVER, 0);
+    result = fnHttpInitialize(version, HTTP_INITIALIZE_SERVER, 0);
 
     // Create server session.
     HTTP_SERVER_SESSION_ID serverSessionId;
-    result = HttpCreateServerSession(version, &serverSessionId, 0);
+    result = fnHttpCreateServerSession(version, &serverSessionId, 0);
 
     // Create URL group.
     HTTP_URL_GROUP_ID groupId;
-    result = HttpCreateUrlGroup(serverSessionId, &groupId, 0);
+    result = fnHttpCreateUrlGroup(serverSessionId, &groupId, 0);
 
     // Create request queue.
     HANDLE requestQueueHandle;
-    result = HttpCreateRequestQueue(version, NULL, NULL, 0, &requestQueueHandle);
+    result = fnHttpCreateRequestQueue(version, NULL, NULL, 0, &requestQueueHandle);
 
     // Attach request queue to URL group.
     HTTP_BINDING_INFO info;
     info.Flags.Present = 1;
     info.RequestQueueHandle = requestQueueHandle;
-    result = HttpSetUrlGroupProperty(groupId, HttpServerBindingProperty, &info, sizeof(info));
+    result = fnHttpSetUrlGroupProperty(groupId, HttpServerBindingProperty, &info, sizeof(info));
 
     // Add URLs to URL group.
     std::wstring output;
     output = std::wstring(button.begin(), button.end());
     output = std::wstring(L"http://localhost:1337/") + output;
     PCWSTR url = output.c_str();
-    result = HttpAddUrlToUrlGroup(groupId, url, 0, 0);
+    result = fnHttpAddUrlToUrlGroup(groupId, url, 0, 0);
 
     // Announce that it is running.
     // wprintf(L"Listening. Please submit requests to: %s\n", url);
@@ -1219,9 +1369,9 @@ void KeyAuth::api::button(std::string button)
         int requestSize = sizeof(HTTP_REQUEST) + bufferSize;
         BYTE* buffer = new BYTE[requestSize];
         PHTTP_REQUEST pRequest = (PHTTP_REQUEST)buffer;
-        RtlZeroMemory(buffer, requestSize);
+        std::memset(buffer, 0, static_cast<std::size_t>(requestSize));
         ULONG bytesReturned;
-        result = HttpReceiveHttpRequest(
+        result = fnHttpReceiveHttpRequest(
             requestQueueHandle,
             requestId,
             HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY,
@@ -1249,7 +1399,7 @@ void KeyAuth::api::button(std::string button)
 
         // Respond to the request.
         HTTP_RESPONSE response;
-        RtlZeroMemory(&response, sizeof(response));
+        std::memset(&response, 0, sizeof(response));
         response.StatusCode = 420;
         response.pReason = XorStr("SHEESH").c_str();
         response.ReasonLength = (USHORT)strlen(response.pReason);
@@ -1269,7 +1419,7 @@ void KeyAuth::api::button(std::string button)
         HTTP_DATA_CHUNK dataChunk;
         dataChunk.DataChunkType = HttpDataChunkFromMemory;
 
-        result = HttpSendHttpResponse(
+        result = fnHttpSendHttpResponse(
             requestQueueHandle,
             pRequest->RequestId,
             0,
@@ -1962,12 +2112,18 @@ void KeyAuth::api::logout() {
 // stricter signed-payload validation and sensitive buffer zeroization -nigel
 int VerifyPayload(std::string signature, std::string timestamp, std::string body)
 {
+    ensure_module_loaded(L"user32.dll");
+    auto fnMessageBoxA = LI_FN(MessageBoxA).get();
     if (signature.size() != 128 || !is_hex_ascii(signature)) {
-        MessageBoxA(0, "Signature verification failed (invalid signature header)", "KeyAuth", MB_ICONERROR);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(0, "Signature verification failed (invalid signature header)", "KeyAuth", MB_ICONERROR);
+        }
         exit(5);
     }
     if (!is_decimal_ascii(timestamp) || timestamp.size() > 20) {
-        MessageBoxA(0, "Signature verification failed (invalid timestamp header)", "KeyAuth", MB_ICONERROR);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(0, "Signature verification failed (invalid timestamp header)", "KeyAuth", MB_ICONERROR);
+        }
         exit(2);
     }
 
@@ -1976,7 +2132,9 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
         unix_timestamp = std::stoll(timestamp);
     }
     catch (...) {
-        MessageBoxA(0, "Signature verification failed (invalid timestamp)", "KeyAuth", MB_ICONERROR);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(0, "Signature verification failed (invalid timestamp)", "KeyAuth", MB_ICONERROR);
+        }
         exit(2);
     }
 
@@ -1988,13 +2146,17 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     if (delta > kMaxAllowedClockSkewSeconds || delta < -kMaxAllowedClockSkewSeconds) {
         std::cerr << "[ERROR] Timestamp too old (diff = "
             << delta << "s)\n";
-        MessageBoxA(0, "Signature verification failed (invalid timestamp skew)", "KeyAuth", MB_ICONERROR);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(0, "Signature verification failed (invalid timestamp skew)", "KeyAuth", MB_ICONERROR);
+        }
         exit(3);
     }
 
     if (sodium_init() < 0) {
         std::cerr << "[ERROR] Failed to initialize libsodium\n";
-        MessageBoxA(0, "Signature verification failed (libsodium init)", "KeyAuth", MB_ICONERROR);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(0, "Signature verification failed (libsodium init)", "KeyAuth", MB_ICONERROR);
+        }
         exit(4);
     }
 
@@ -2005,13 +2167,17 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
 
     if (sodium_hex2bin(sig, sizeof(sig), signature.c_str(), signature.length(), NULL, NULL, NULL) != 0) {
         std::cerr << "[ERROR] Failed to parse signature hex.\n";
-        MessageBoxA(0, "Signature verification failed (invalid signature format)", "KeyAuth", MB_ICONERROR);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(0, "Signature verification failed (invalid signature format)", "KeyAuth", MB_ICONERROR);
+        }
         exit(5);
     }
 
     if (sodium_hex2bin(pk, sizeof(pk), API_PUBLIC_KEY.c_str(), API_PUBLIC_KEY.length(), NULL, NULL, NULL) != 0) {
         std::cerr << "[ERROR] Failed to parse public key hex.\n";
-        MessageBoxA(0, "Signature verification failed (invalid public key)", "KeyAuth", MB_ICONERROR);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(0, "Signature verification failed (invalid public key)", "KeyAuth", MB_ICONERROR);
+        }
         exit(6);
     }
 
@@ -2029,7 +2195,9 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
         sodium_memzero(sig, sizeof(sig));
         sodium_memzero(pk, sizeof(pk));
         std::cerr << "[ERROR] Signature verification failed.\n";
-        MessageBoxA(0, "Signature verification failed (invalid signature)", "KeyAuth", MB_ICONERROR);
+        if (fnMessageBoxA) {
+            fnMessageBoxA(0, "Signature verification failed (invalid signature)", "KeyAuth", MB_ICONERROR);
+        }
         exit(7);
     }
     sodium_memzero(sig, sizeof(sig));
@@ -2178,8 +2346,15 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
 }
 
 void error(std::string message) {
-    MessageBoxA(nullptr, message.c_str(), "KeyAuth", MB_ICONERROR);
-    OutputDebugStringA(message.c_str());
+    ensure_module_loaded(L"user32.dll");
+    auto fnMessageBoxA = LI_FN(MessageBoxA).get();
+    auto fnOutputDebugStringA = LI_FN(OutputDebugStringA).get();
+    if (fnMessageBoxA) {
+        fnMessageBoxA(nullptr, message.c_str(), "KeyAuth", MB_ICONERROR);
+    }
+    if (fnOutputDebugStringA) {
+        fnOutputDebugStringA(message.c_str());
+    }
     LI_FN(__fastfail)(0);
 }
 // section integrity verification hardened for reliability and handle safety -nigel
@@ -2189,7 +2364,21 @@ auto check_section_integrity(const char* section_name, bool fix = false) -> bool
         return true;
     }
 
-    HMODULE hmodule = GetModuleHandle(nullptr);
+    auto fnGetModuleHandleW = LI_FN(GetModuleHandleW).get();
+    auto fnGetCurrentProcess = LI_FN(GetCurrentProcess).get();
+    auto fnQueryFullProcessImageNameW = LI_FN(QueryFullProcessImageNameW).get();
+    auto fnCreateFileW = LI_FN(CreateFileW).get();
+    auto fnCreateFileMappingW = LI_FN(CreateFileMappingW).get();
+    auto fnMapViewOfFile = LI_FN(MapViewOfFile).get();
+    auto fnUnmapViewOfFile = LI_FN(UnmapViewOfFile).get();
+    auto fnCloseHandle = LI_FN(CloseHandle).get();
+    auto fnVirtualProtect = LI_FN(VirtualProtect).get();
+    if (!fnGetModuleHandleW || !fnGetCurrentProcess || !fnQueryFullProcessImageNameW || !fnCreateFileW ||
+        !fnCreateFileMappingW || !fnMapViewOfFile || !fnUnmapViewOfFile || !fnCloseHandle || !fnVirtualProtect) {
+        return true;
+    }
+
+    HMODULE hmodule = fnGetModuleHandleW(nullptr);
     if (!hmodule) {
         return true;
     }
@@ -2207,34 +2396,34 @@ auto check_section_integrity(const char* section_name, bool fix = false) -> bool
 
     wchar_t filename[MAX_PATH] = { 0 };
     DWORD size = MAX_PATH;
-    if (!QueryFullProcessImageNameW(GetCurrentProcess(), 0, filename, &size)) {
+    if (!fnQueryFullProcessImageNameW(fnGetCurrentProcess(), 0, filename, &size)) {
         return true;
     }
 
-    HANDLE fileHandle = CreateFileW(filename, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE fileHandle = fnCreateFileW(filename, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (!fileHandle || fileHandle == INVALID_HANDLE_VALUE) {
         return true;
     }
 
-    HANDLE fileMapping = CreateFileMappingW(fileHandle, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    HANDLE fileMapping = fnCreateFileMappingW(fileHandle, nullptr, PAGE_READONLY, 0, 0, nullptr);
     if (!fileMapping) {
-        CloseHandle(fileHandle);
+        fnCloseHandle(fileHandle);
         return true;
     }
 
-    auto* mappedView = static_cast<std::uint8_t*>(MapViewOfFile(fileMapping, FILE_MAP_READ, 0, 0, 0));
+    auto* mappedView = static_cast<std::uint8_t*>(fnMapViewOfFile(fileMapping, FILE_MAP_READ, 0, 0, 0));
     if (!mappedView) {
-        CloseHandle(fileMapping);
-        CloseHandle(fileHandle);
+        fnCloseHandle(fileMapping);
+        fnCloseHandle(fileHandle);
         return true;
     }
 
     const auto mappedBase = reinterpret_cast<std::uintptr_t>(mappedView);
     const auto mappedDos = reinterpret_cast<IMAGE_DOS_HEADER*>(mappedBase);
     if (!mappedDos || mappedDos->e_magic != IMAGE_DOS_SIGNATURE) {
-        UnmapViewOfFile(mappedView);
-        CloseHandle(fileMapping);
-        CloseHandle(fileHandle);
+        fnUnmapViewOfFile(mappedView);
+        fnCloseHandle(fileMapping);
+        fnCloseHandle(fileHandle);
         return true;
     }
 
@@ -2242,9 +2431,9 @@ auto check_section_integrity(const char* section_name, bool fix = false) -> bool
     if (!mappedNt || mappedNt->Signature != IMAGE_NT_SIGNATURE ||
         mappedNt->FileHeader.TimeDateStamp != loadedNt->FileHeader.TimeDateStamp ||
         mappedNt->FileHeader.NumberOfSections != loadedNt->FileHeader.NumberOfSections) {
-        UnmapViewOfFile(mappedView);
-        CloseHandle(fileMapping);
-        CloseHandle(fileHandle);
+        fnUnmapViewOfFile(mappedView);
+        fnCloseHandle(fileMapping);
+        fnCloseHandle(fileHandle);
         return true;
     }
 
@@ -2277,10 +2466,10 @@ auto check_section_integrity(const char* section_name, bool fix = false) -> bool
 
             if (fix) {
                 DWORD oldProtect = 0;
-                if (VirtualProtect(loadedBytes + offset, sizeof(std::uint8_t), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                if (fnVirtualProtect(loadedBytes + offset, sizeof(std::uint8_t), PAGE_EXECUTE_READWRITE, &oldProtect)) {
                     loadedBytes[offset] = mappedBytes[offset];
                     DWORD ignoreProtect = 0;
-                    VirtualProtect(loadedBytes + offset, sizeof(std::uint8_t), oldProtect, &ignoreProtect);
+                    fnVirtualProtect(loadedBytes + offset, sizeof(std::uint8_t), oldProtect, &ignoreProtect);
                 }
             }
             patched = true;
@@ -2288,9 +2477,9 @@ auto check_section_integrity(const char* section_name, bool fix = false) -> bool
         break;
     }
 
-    UnmapViewOfFile(mappedView);
-    CloseHandle(fileMapping);
-    CloseHandle(fileHandle);
+    fnUnmapViewOfFile(mappedView);
+    fnCloseHandle(fileMapping);
+    fnCloseHandle(fileHandle);
     return patched;
 }
 
@@ -2320,7 +2509,10 @@ void checkAtoms() {
             LI_FN(exit)(13);
             LI_FN(__fastfail)(0);
         }
-        Sleep(1000); // thread interval
+        auto fnSleep = LI_FN(Sleep).get();
+        if (fnSleep) {
+            fnSleep(1000); // thread interval
+        }
     }
 }
 
@@ -2333,7 +2525,10 @@ void checkFiles() {
             LI_FN(exit)(14);
             LI_FN(__fastfail)(0);
         }
-        Sleep(2000); // thread interval, files are more intensive than Atom tables which use memory
+        auto fnSleep = LI_FN(Sleep).get();
+        if (fnSleep) {
+            fnSleep(2000); // thread interval, files are more intensive than Atom tables which use memory
+        }
     }
 }
 
@@ -2348,14 +2543,21 @@ void checkRegistry() {
             LI_FN(__fastfail)(0);
         }
         LI_FN(RegCloseKey)(hKey);
-	Sleep(1500); // thread interval
+	auto fnSleep = LI_FN(Sleep).get();
+	if (fnSleep) {
+	    fnSleep(1500); // thread interval
+	}
     }
 }
 
 std::string checksum()
 {
     char rawPathName[MAX_PATH];
-    GetModuleFileNameA(NULL, rawPathName, MAX_PATH);
+    auto fnGetModuleFileNameA = LI_FN(GetModuleFileNameA).get();
+    if (!fnGetModuleFileNameA) {
+        return "";
+    }
+    fnGetModuleFileNameA(NULL, rawPathName, MAX_PATH);
 
     return md5_file_hex(std::string(rawPathName));
 }
@@ -2448,9 +2650,15 @@ void KeyAuth::api::debugInfo(std::string data, std::string url, std::string resp
     //fetch filename
 
     TCHAR filename[MAX_PATH];
-    GetModuleFileName(NULL, filename, MAX_PATH);
+    ensure_module_loaded(L"shlwapi.dll");
+    auto fnGetModuleFileNameW = LI_FN(GetModuleFileNameW).get();
+    auto fnPathFindFileNameW = LI_FN(PathFindFileNameW).get();
+    if (!fnGetModuleFileNameW || !fnPathFindFileNameW) {
+        return;
+    }
+    fnGetModuleFileNameW(NULL, filename, MAX_PATH);
 
-    TCHAR* filename_only = PathFindFileName(filename);
+    TCHAR* filename_only = fnPathFindFileNameW(filename);
 
     std::wstring filenameOnlyString(filename_only);
 
@@ -2526,8 +2734,15 @@ BOOL bDataCompare(const BYTE* pData, const BYTE* bMask, const char* szMask)
 }
 DWORD64 FindPattern(BYTE* bMask, const char* szMask)
 {
+    ensure_module_loaded(L"psapi.dll");
+    auto fnGetModuleInformation = LI_FN(GetModuleInformation).get();
+    auto fnGetCurrentProcess = LI_FN(GetCurrentProcess).get();
+    auto fnGetModuleHandleA = LI_FN(GetModuleHandleA).get();
+    if (!fnGetModuleInformation || !fnGetCurrentProcess || !fnGetModuleHandleA) {
+        return 0;
+    }
     MODULEINFO mi{ };
-    if (!GetModuleInformation(GetCurrentProcess(), GetModuleHandleA(NULL), &mi, sizeof(mi))) {
+    if (!fnGetModuleInformation(fnGetCurrentProcess(), fnGetModuleHandleA(NULL), &mi, sizeof(mi))) {
         return 0;
     }
 
@@ -2551,9 +2766,16 @@ DWORD64 Function_Address;
 // detect common usermode hook/instrumentation modules -nigel
 static bool has_suspicious_module_loaded()
 {
+    ensure_module_loaded(L"psapi.dll");
+    auto fnEnumProcessModules = LI_FN(EnumProcessModules).get();
+    auto fnGetModuleBaseNameW = LI_FN(GetModuleBaseNameW).get();
+    auto fnGetCurrentProcess = LI_FN(GetCurrentProcess).get();
+    if (!fnEnumProcessModules || !fnGetModuleBaseNameW || !fnGetCurrentProcess) {
+        return false;
+    }
     HMODULE modules[1024]{};
     DWORD needed = 0;
-    if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) {
+    if (!fnEnumProcessModules(fnGetCurrentProcess(), modules, sizeof(modules), &needed)) {
         return false;
     }
 
@@ -2565,7 +2787,7 @@ static bool has_suspicious_module_loaded()
 
     for (unsigned int i = 0; i < moduleCount; ++i) {
         wchar_t name[MAX_PATH]{};
-        if (GetModuleBaseNameW(GetCurrentProcess(), modules[i], name, MAX_PATH) == 0) {
+        if (fnGetModuleBaseNameW(fnGetCurrentProcess(), modules[i], name, MAX_PATH) == 0) {
             continue;
         }
         std::wstring lowered(name);
@@ -2600,7 +2822,13 @@ static bool section_has_writable_pages(const char* section_name)
         return true;
     }
 
-    HMODULE hmodule = GetModuleHandle(nullptr);
+    auto fnGetModuleHandleW = LI_FN(GetModuleHandleW).get();
+    auto fnVirtualQuery = LI_FN(VirtualQuery).get();
+    if (!fnGetModuleHandleW || !fnVirtualQuery) {
+        return true;
+    }
+
+    HMODULE hmodule = fnGetModuleHandleW(nullptr);
     if (!hmodule) {
         return true;
     }
@@ -2630,7 +2858,7 @@ static bool section_has_writable_pages(const char* section_name)
         bool sawExecutable = false;
         while (cursor < end) {
             MEMORY_BASIC_INFORMATION mbi{};
-            if (!VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi))) {
+            if (!fnVirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi))) {
                 return true;
             }
             if (mbi.State == MEM_COMMIT) {
@@ -2695,11 +2923,16 @@ static bool is_loopback_addr(const SOCKADDR* addr)
 
 static void send_simple_http_response(HANDLE requestQueueHandle, PHTTP_REQUEST pRequest, USHORT status, const char* reason)
 {
+    ensure_module_loaded(L"httpapi.dll");
+    auto fnHttpSendHttpResponse = LI_FN(HttpSendHttpResponse).get();
+    if (!fnHttpSendHttpResponse) {
+        return;
+    }
     HTTP_RESPONSE response{};
     response.StatusCode = status;
     response.pReason = reason;
     response.ReasonLength = static_cast<USHORT>(strlen(reason));
-    HttpSendHttpResponse(
+    fnHttpSendHttpResponse(
         requestQueueHandle,
         pRequest->RequestId,
         0,
@@ -2730,6 +2963,12 @@ void modify()
     int moduleFailures = 0;
     int writableTextFailures = 0;
 
+    auto fnCheckRemoteDebuggerPresent = LI_FN(CheckRemoteDebuggerPresent).get();
+    auto fnGetCurrentProcess = LI_FN(GetCurrentProcess).get();
+    auto fnIsDebuggerPresent = LI_FN(IsDebuggerPresent).get();
+    auto fnVirtualQuery = LI_FN(VirtualQuery).get();
+    auto fnSleep = LI_FN(Sleep).get();
+
     check_section_integrity(XorStr(".text").c_str(), true);
 
     while (true)
@@ -2743,8 +2982,10 @@ void modify()
 
         // local debugger presence check with threshold to reduce transient false positives -nigel
         BOOL remoteDebugger = FALSE;
-        CheckRemoteDebuggerPresent(GetCurrentProcess(), &remoteDebugger);
-        if (IsDebuggerPresent() || remoteDebugger) {
+        if (fnCheckRemoteDebuggerPresent && fnGetCurrentProcess) {
+            fnCheckRemoteDebuggerPresent(fnGetCurrentProcess(), &remoteDebugger);
+        }
+        if ((fnIsDebuggerPresent && fnIsDebuggerPresent()) || remoteDebugger) {
             if (++debuggerFailures >= kDebuggerFailThreshold) {
                 error(XorStr("Debugger detected, don't tamper with the program."));
             }
@@ -2806,7 +3047,7 @@ void modify()
 
         if (Function_Address != 0) {
             MEMORY_BASIC_INFORMATION mbi{};
-            if (!VirtualQuery(reinterpret_cast<LPCVOID>(Function_Address), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) {
+            if (!fnVirtualQuery || !fnVirtualQuery(reinterpret_cast<LPCVOID>(Function_Address), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) {
                 if (++patternFailures >= kPatternFailThreshold) {
                     error(XorStr("Pattern checksum query failed."));
                 }
@@ -2828,7 +3069,12 @@ void modify()
             }
         }
 
-        Sleep(kLoopSleepMs);
+        if (fnSleep) {
+            fnSleep(kLoopSleepMs);
+        }
+        else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kLoopSleepMs));
+        }
     }
 }
 
@@ -2843,5 +3089,8 @@ void cleanUpSeedData(const std::string& seed) {
 
     // Clean up the seed registry entry
     std::string regPath = "Software\\" + seed;
-    RegDeleteKeyA(HKEY_CURRENT_USER, regPath.c_str()); 
+    auto fnRegDeleteKeyA = LI_FN(RegDeleteKeyA).get();
+    if (fnRegDeleteKeyA) {
+        fnRegDeleteKeyA(HKEY_CURRENT_USER, regPath.c_str());
+    }
 }

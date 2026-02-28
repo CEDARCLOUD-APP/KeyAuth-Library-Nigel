@@ -60,6 +60,7 @@ this repo keeps keyauth api behavior compatible while adding stronger local secu
 - added process checks for common hook/debug usermode modules
 - moved emulator windows api calls to lazy imports for import hiding
 - moved auth windows api calls to lazy imports for import hiding
+- added lazy module loading + lazy imports for httpapi/psapi/shlwapi/bcrypt paths
 
 ## build (windows)
 - open `library.sln` in visual studio
