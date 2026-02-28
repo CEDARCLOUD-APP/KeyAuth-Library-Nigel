@@ -15,6 +15,10 @@
 template <auto Fn>
 struct KeyauthDirectFn {
     auto get() const { return Fn; }
+    template <typename... Args>
+    decltype(auto) operator()(Args&&... args) const {
+        return Fn(std::forward<Args>(args)...);
+    }
 };
 #endif
 #undef LI_FN

@@ -28,10 +28,20 @@
 template <auto Fn>
 struct KeyauthDirectFn {
     auto get() const { return Fn; }
+    template <typename... Args>
+    decltype(auto) operator()(Args&&... args) const {
+        return Fn(std::forward<Args>(args)...);
+    }
 };
 #endif
 #undef LI_FN
 #define LI_FN(name) KeyauthDirectFn<&name>{}
+#endif
+
+#ifdef KEYAUTH_DISABLE_LAZY_IMPORTS
+#define KEYAUTH_FASTFAIL(code) __fastfail(code)
+#else
+#define KEYAUTH_FASTFAIL(code) LI_FN(__fastfail)(code)
 #endif
 
 #include <sstream> 
@@ -2379,7 +2389,7 @@ void error(std::string message) {
     if (fnOutputDebugStringA) {
         fnOutputDebugStringA(message.c_str());
     }
-    LI_FN(__fastfail)(0);
+    KEYAUTH_FASTFAIL(0);
 }
 // section integrity verification hardened for reliability and handle safety -nigel
 auto check_section_integrity(const char* section_name, bool fix = false) -> bool
@@ -2531,7 +2541,7 @@ void checkAtoms() {
     while (true) {
         if (LI_FN(GlobalFindAtomA)(seed.c_str()) == 0) {
             LI_FN(exit)(13);
-            LI_FN(__fastfail)(0);
+            KEYAUTH_FASTFAIL(0);
         }
         auto fnSleep = LI_FN(Sleep).get();
         if (fnSleep) {
@@ -2547,7 +2557,7 @@ void checkFiles() {
         DWORD file_attr = LI_FN(GetFileAttributesA)(file_path.c_str());
         if (file_attr == INVALID_FILE_ATTRIBUTES || (file_attr & FILE_ATTRIBUTE_DIRECTORY)) {
             LI_FN(exit)(14);
-            LI_FN(__fastfail)(0);
+            KEYAUTH_FASTFAIL(0);
         }
         auto fnSleep = LI_FN(Sleep).get();
         if (fnSleep) {
@@ -2564,7 +2574,7 @@ void checkRegistry() {
         LONG result = LI_FN(RegOpenKeyExA)(HKEY_CURRENT_USER, regPath.c_str(), 0, KEY_READ, &hKey);
         if (result != ERROR_SUCCESS) {
             LI_FN(exit)(15);
-            LI_FN(__fastfail)(0);
+            KEYAUTH_FASTFAIL(0);
         }
         LI_FN(RegCloseKey)(hKey);
 	auto fnSleep = LI_FN(Sleep).get();
