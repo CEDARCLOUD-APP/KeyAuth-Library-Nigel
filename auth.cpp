@@ -2485,6 +2485,12 @@ static bool is_writable_page_protection(DWORD protect)
     return (protect & writableMask) != 0;
 }
 
+static bool is_executable_page_protection(DWORD protect)
+{
+    const DWORD execMask = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return (protect & execMask) != 0;
+}
+
 // verify executable code section is not writable in memory -nigel
 static bool section_has_writable_pages(const char* section_name)
 {
@@ -2519,13 +2525,22 @@ static bool section_has_writable_pages(const char* section_name)
         const std::size_t sectionSize = section->Misc.VirtualSize ? section->Misc.VirtualSize : section->SizeOfRawData;
         const std::uintptr_t end = start + sectionSize;
         std::uintptr_t cursor = start;
+        bool sawExecutable = false;
         while (cursor < end) {
             MEMORY_BASIC_INFORMATION mbi{};
             if (!VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi))) {
                 return true;
             }
-            if (mbi.State == MEM_COMMIT && is_writable_page_protection(mbi.Protect)) {
-                return true;
+            if (mbi.State == MEM_COMMIT) {
+                if (is_executable_page_protection(mbi.Protect)) {
+                    sawExecutable = true;
+                }
+                if (is_writable_page_protection(mbi.Protect)) {
+                    // reduce false positives: only treat writable executable pages as tamper -nigel
+                    if (is_executable_page_protection(mbi.Protect)) {
+                        return true;
+                    }
+                }
             }
             const std::uintptr_t next = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
             if (next <= cursor) {
@@ -2533,7 +2548,8 @@ static bool section_has_writable_pages(const char* section_name)
             }
             cursor = next;
         }
-        return false;
+        // if we never saw executable pages in .text, something is off -nigel
+        return !sawExecutable;
     }
 
     return true;

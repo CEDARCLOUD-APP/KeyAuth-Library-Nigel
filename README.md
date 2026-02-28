@@ -34,7 +34,7 @@ this repo keeps keyauth api behavior compatible while adding stronger local secu
 - fixed unsafe web login reason-string lifetime bug
 - fixed optional path logic bug (`!path.empty()`)
 - added suspicious module detection in modify loop
-- added writable `.text` page detection in modify loop
+- refined writable `.text` page detection (exec+writable only)
 - tightened transport runtime flags (no netrc/auth/cookies)
 
 ## emulator / anti-tamper updates
