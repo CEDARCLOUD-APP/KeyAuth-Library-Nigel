@@ -11,7 +11,6 @@
 #endif
 
 #define _CRT_SECURE_NO_WARNINGS
-#define KEYAUTH_DISABLE_LAZY_IMPORTS
 
 #include <auth.hpp>
 #include <strsafe.h> 
@@ -21,9 +20,6 @@
 #include <iostream>
 
 #include <shellapi.h>
-#include <lazy_importer.hpp>
-#ifdef KEYAUTH_DISABLE_LAZY_IMPORTS
-// disable lazy imports for debugging stability checks -nigel
 #ifndef KEYAUTH_DIRECT_LI_DEFINED
 #define KEYAUTH_DIRECT_LI_DEFINED
 template <auto Fn>
@@ -37,13 +33,8 @@ struct KeyauthDirectFn {
 #endif
 #undef LI_FN
 #define LI_FN(name) KeyauthDirectFn<&name>{}
-#endif
 
-#ifdef KEYAUTH_DISABLE_LAZY_IMPORTS
 #define KEYAUTH_FASTFAIL(code) __fastfail(code)
-#else
-#define KEYAUTH_FASTFAIL(code) LI_FN(__fastfail)(code)
-#endif
 
 #include <sstream> 
 #include <iomanip> 

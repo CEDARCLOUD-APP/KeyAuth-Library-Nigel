@@ -7,9 +7,6 @@
 #include <string>
 #include <algorithm>
 #include <mutex>
-#include <lazy_importer.hpp>
-#ifdef KEYAUTH_DISABLE_LAZY_IMPORTS
-// disable lazy imports for debugging stability checks -nigel
 #ifndef KEYAUTH_DIRECT_LI_DEFINED
 #define KEYAUTH_DIRECT_LI_DEFINED
 template <auto Fn>
@@ -23,7 +20,6 @@ struct KeyauthDirectFn {
 #endif
 #undef LI_FN
 #define LI_FN(name) KeyauthDirectFn<&name>{}
-#endif
 
 // https://github.com/LiamG53
 
