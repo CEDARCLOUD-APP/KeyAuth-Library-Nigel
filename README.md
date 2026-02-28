@@ -33,6 +33,9 @@ this repo keeps keyauth api behavior compatible while adding stronger local secu
 - added xor object zeroization behavior on teardown
 - fixed unsafe web login reason-string lifetime bug
 - fixed optional path logic bug (`!path.empty()`)
+- added suspicious module detection in modify loop
+- added writable `.text` page detection in modify loop
+- tightened transport runtime flags (no netrc/auth/cookies)
 
 ## emulator / anti-tamper updates
 - `killEmulator.hpp` now installs veh once via `std::call_once`
@@ -41,6 +44,7 @@ this repo keeps keyauth api behavior compatible while adding stronger local secu
 - added low-resource and hypervisor weighted risk checks
 - added heartbeat gate for repeated local environment checks
 - added safer pointer/context guards inside exception handler
+- added process checks for common hook/debug usermode modules
 
 ## build (windows)
 - open `library.sln` in visual studio

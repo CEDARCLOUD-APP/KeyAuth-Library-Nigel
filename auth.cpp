@@ -55,6 +55,7 @@
 #include <cctype>
 #include <algorithm>
 #include <cstring>
+#include <cwctype>
 
 #include "Security.hpp"
 #include "killEmulator.hpp"
@@ -2028,6 +2029,11 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     curl_easy_setopt(curl, CURLOPT_PROXY, "");
     curl_easy_setopt(curl, CURLOPT_HTTPPROXYTUNNEL, 0L);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(curl, CURLOPT_NETRC, CURL_NETRC_IGNORED);
+    curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_NONE);
+    curl_easy_setopt(curl, CURLOPT_PROXYAUTH, CURLAUTH_NONE);
+    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
+    curl_easy_setopt(curl, CURLOPT_COOKIEJAR, "");
     curl_easy_setopt(curl, CURLOPT_CERTINFO, 1L);
     curl_easy_setopt(curl, CURLOPT_NOPROXY, XorStr("keyauth.win").c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
@@ -2439,6 +2445,100 @@ DWORD64 FindPattern(BYTE* bMask, const char* szMask)
 }
 
 DWORD64 Function_Address;
+
+// detect common usermode hook/instrumentation modules -nigel
+static bool has_suspicious_module_loaded()
+{
+    HMODULE modules[1024]{};
+    DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) {
+        return false;
+    }
+
+    const unsigned int moduleCount = needed / sizeof(HMODULE);
+    const std::wstring blocked[] = {
+        L"frida-agent.dll", L"frida-gadget.dll", L"easyhook64.dll", L"easyhook32.dll",
+        L"detoured.dll", L"scyllahide.dll", L"dbghelp.dll"
+    };
+
+    for (unsigned int i = 0; i < moduleCount; ++i) {
+        wchar_t name[MAX_PATH]{};
+        if (GetModuleBaseNameW(GetCurrentProcess(), modules[i], name, MAX_PATH) == 0) {
+            continue;
+        }
+        std::wstring lowered(name);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+            [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+        for (const auto& item : blocked) {
+            if (lowered == item) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool is_writable_page_protection(DWORD protect)
+{
+    const DWORD writableMask = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return (protect & writableMask) != 0;
+}
+
+// verify executable code section is not writable in memory -nigel
+static bool section_has_writable_pages(const char* section_name)
+{
+    if (!section_name || !*section_name) {
+        return true;
+    }
+
+    HMODULE hmodule = GetModuleHandle(nullptr);
+    if (!hmodule) {
+        return true;
+    }
+
+    const auto base = reinterpret_cast<std::uintptr_t>(hmodule);
+    const auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return true;
+    }
+    const auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE) {
+        return true;
+    }
+
+    char targetSectionName[8] = { 0 };
+    std::memcpy(targetSectionName, section_name, std::min<std::size_t>(8, std::strlen(section_name)));
+    auto* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (std::memcmp(section->Name, targetSectionName, sizeof(targetSectionName)) != 0) {
+            continue;
+        }
+
+        const std::uintptr_t start = base + section->VirtualAddress;
+        const std::size_t sectionSize = section->Misc.VirtualSize ? section->Misc.VirtualSize : section->SizeOfRawData;
+        const std::uintptr_t end = start + sectionSize;
+        std::uintptr_t cursor = start;
+        while (cursor < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi))) {
+                return true;
+            }
+            if (mbi.State == MEM_COMMIT && is_writable_page_protection(mbi.Protect)) {
+                return true;
+            }
+            const std::uintptr_t next = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (next <= cursor) {
+                return true;
+            }
+            cursor = next;
+        }
+        return false;
+    }
+
+    return true;
+}
+
 void modify()
 {
     // anti-tamper loop hardened for reliability and reduced false positives -nigel
@@ -2447,10 +2547,14 @@ void modify()
     constexpr int kLockMemFailThreshold = 3;
     constexpr int kPatternFailThreshold = 3;
     constexpr int kDebuggerFailThreshold = 2;
+    constexpr int kModuleFailThreshold = 2;
+    constexpr int kWritableTextFailThreshold = 2;
     int sectionFailures = 0;
     int lockMemFailures = 0;
     int patternFailures = 0;
     int debuggerFailures = 0;
+    int moduleFailures = 0;
+    int writableTextFailures = 0;
 
     check_section_integrity(XorStr(".text").c_str(), true);
 
@@ -2490,6 +2594,26 @@ void modify()
         }
         else {
             lockMemFailures = 0;
+        }
+
+        // detect common hook/instrumentation modules in-process -nigel
+        if (has_suspicious_module_loaded()) {
+            if (++moduleFailures >= kModuleFailThreshold) {
+                error(XorStr("Suspicious module detected, don't tamper with the program."));
+            }
+        }
+        else {
+            moduleFailures = 0;
+        }
+
+        // executable section should never remain writable in normal flow -nigel
+        if (section_has_writable_pages(XorStr(".text").c_str())) {
+            if (++writableTextFailures >= kWritableTextFailThreshold) {
+                error(XorStr("Writable code section detected, don't tamper with the program."));
+            }
+        }
+        else {
+            writableTextFailures = 0;
         }
 
         if (Function_Address == 0) {
