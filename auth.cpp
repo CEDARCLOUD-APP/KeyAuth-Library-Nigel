@@ -86,9 +86,6 @@ std::atomic<bool> initialized(false);
 std::string API_PUBLIC_KEY = "5586b4bc69c7a4b487e4563a4cd96afd39140f919bd31cea7d1c6a1e8439422b";
 bool KeyAuth::api::debug = false;
 std::atomic<bool> LoggedIn(false);
-static std::atomic<bool> g_modify_alive(false);
-static std::atomic<unsigned long long> g_modify_tick(0);
-static std::atomic<bool> g_modify_started(false);
 static bool is_localhost_host(const wchar_t* host);
 static bool is_loopback_addr(const SOCKADDR* addr);
 static void send_simple_http_response(HANDLE requestQueueHandle, PHTTP_REQUEST pRequest, USHORT status, const char* reason);
@@ -97,8 +94,9 @@ static bool is_debugger_present_advanced();
 static void best_effort_hide_from_debugger();
 static bool module_text_has_writable_pages(HMODULE module);
 static bool module_text_differs_from_disk(HMODULE module);
-static bool is_modify_thread_healthy();
-static void integrity_watchdog();
+static bool is_ntdll_export_hooked(const char* exportName);
+static void integrity_pulse_light();
+static void integrity_pulse_heavy();
 static HMODULE ensure_module_loaded(const wchar_t* name);
 
 // optional compatibility toggle for injected/DLL use-cases -nigel
@@ -443,7 +441,6 @@ void KeyAuth::api::init()
     ensure_module_loaded(L"shell32.dll");
     ensure_module_loaded(L"ntdll.dll");
     best_effort_hide_from_debugger(); // anti-attach best effort -nigel
-    std::thread(integrity_watchdog).detach(); // watchdog to prevent single-point disable -nigel
     std::thread(runChecks).detach();
     seed = generate_random_number();
     std::atexit([]() { cleanUpSeedData(seed); });
@@ -2268,9 +2265,7 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     signature.clear();
     signatureTimestamp.clear();
 
-    if (!is_modify_thread_healthy()) {
-        error(XorStr("Integrity watchdog tripped, don't tamper with the program."));
-    }
+    integrity_pulse_light();
 
     if (data.size() > kMaxRequestBytes) {
         error(XorStr("Request too large."));
@@ -2955,6 +2950,43 @@ static bool is_proc_from_module(void* proc, HMODULE module)
     return (mbi.AllocationBase == module) && (mbi.Type == MEM_IMAGE);
 }
 
+// detect common ntdll export hook patterns -nigel
+static bool is_ntdll_export_hooked(const char* exportName)
+{
+    if (!exportName || !*exportName) {
+        return false;
+    }
+    ensure_module_loaded(L"ntdll.dll");
+    auto fnGetProcAddress = LI_FN(GetProcAddress).get();
+    auto ntdll = ensure_module_loaded(L"ntdll.dll");
+    if (!fnGetProcAddress || !ntdll) {
+        return false;
+    }
+    auto proc = fnGetProcAddress(ntdll, exportName);
+    if (!proc) {
+        return false;
+    }
+
+    if (!is_proc_from_module(proc, ntdll)) {
+        return true;
+    }
+
+    const auto* code = reinterpret_cast<const unsigned char*>(proc);
+    // Typical hook patterns: JMP rel32, JMP [rip+imm32], MOV RAX; JMP RAX/CALL RAX
+    if (code[0] == 0xE9 || code[0] == 0xE8) { // jmp/call rel32
+        return true;
+    }
+    if (code[0] == 0xFF && code[1] == 0x25) { // jmp [rip+imm32]
+        return true;
+    }
+    if (code[0] == 0x48 && code[1] == 0xB8) { // mov rax, imm64
+        if (code[10] == 0xFF && (code[11] == 0xE0 || code[11] == 0xD0)) { // jmp/call rax
+            return true;
+        }
+    }
+    return false;
+}
+
 // advanced anti-attach check using NtQueryInformationProcess -nigel
 static bool is_debugger_present_advanced()
 {
@@ -3173,47 +3205,69 @@ static bool module_text_differs_from_disk(HMODULE module)
 }
 
 // watchdog health check for modify loop -nigel
-static bool is_modify_thread_healthy()
+// quick integrity pulse to avoid single-point disable -nigel
+static void integrity_pulse_light()
 {
-    if (!g_modify_started.load(std::memory_order_acquire)) {
-        return true;
+    if (is_debugger_present_advanced()) {
+        error(XorStr("Advanced debugger attach detected, don't tamper with the program."));
     }
-    const unsigned long long tick = g_modify_tick.load(std::memory_order_acquire);
-    if (tick == 0) {
-        return false;
+
+    auto fnCheckRemoteDebuggerPresent = LI_FN(CheckRemoteDebuggerPresent).get();
+    auto fnGetCurrentProcess = LI_FN(GetCurrentProcess).get();
+    auto fnIsDebuggerPresent = LI_FN(IsDebuggerPresent).get();
+    BOOL remoteDebugger = FALSE;
+    if (fnCheckRemoteDebuggerPresent && fnGetCurrentProcess) {
+        fnCheckRemoteDebuggerPresent(fnGetCurrentProcess(), &remoteDebugger);
     }
-    static unsigned long long lastTick = 0;
-    if (tick == lastTick) {
-        return false;
+    if ((fnIsDebuggerPresent && fnIsDebuggerPresent()) || remoteDebugger) {
+        error(XorStr("Debugger detected, don't tamper with the program."));
     }
-    lastTick = tick;
-    return g_modify_alive.load(std::memory_order_acquire);
+
+    if (has_suspicious_module_loaded()) {
+        error(XorStr("Suspicious module detected, don't tamper with the program."));
+    }
+
+    if (section_has_writable_pages(XorStr(".text").c_str())) {
+        error(XorStr("Writable code section detected, don't tamper with the program."));
+    }
 }
 
-// watchdog thread: fails closed if modify loop is stopped/neutralized -nigel
-static void integrity_watchdog()
+// heavier integrity pulse run on a slower cadence -nigel
+static void integrity_pulse_heavy()
 {
-    auto fnSleep = LI_FN(Sleep).get();
-    unsigned int graceMs = 10000; // allow modify to start -nigel
-    while (!g_modify_started.load(std::memory_order_acquire) && graceMs > 0) {
-        if (fnSleep) {
-            fnSleep(250);
-        }
-        else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        }
-        graceMs -= 250;
+    auto fnGetModuleHandleW = LI_FN(GetModuleHandleW).get();
+    if (!fnGetModuleHandleW) {
+        return;
     }
-    for (;;) {
-        if (!is_modify_thread_healthy()) {
-            error(XorStr("Integrity watchdog tripped, don't tamper with the program."));
-        }
-        if (fnSleep) {
-            fnSleep(1500);
-        }
-        else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-        }
+    HMODULE ntdll = fnGetModuleHandleW(L"ntdll.dll");
+    HMODULE kernel32 = fnGetModuleHandleW(L"kernel32.dll");
+    HMODULE kernelbase = fnGetModuleHandleW(L"kernelbase.dll");
+
+    if (ntdll && module_text_differs_from_disk(ntdll)) {
+        error(XorStr("System module integrity check failed, don't tamper with the program."));
+    }
+    if (kernel32 && module_text_differs_from_disk(kernel32)) {
+        error(XorStr("System module integrity check failed, don't tamper with the program."));
+    }
+    if (kernelbase && module_text_differs_from_disk(kernelbase)) {
+        error(XorStr("System module integrity check failed, don't tamper with the program."));
+    }
+
+    if (ntdll && module_text_has_writable_pages(ntdll)) {
+        error(XorStr("System module integrity check failed, don't tamper with the program."));
+    }
+    if (kernel32 && module_text_has_writable_pages(kernel32)) {
+        error(XorStr("System module integrity check failed, don't tamper with the program."));
+    }
+    if (kernelbase && module_text_has_writable_pages(kernelbase)) {
+        error(XorStr("System module integrity check failed, don't tamper with the program."));
+    }
+
+    if (is_ntdll_export_hooked("NtQueryInformationProcess") ||
+        is_ntdll_export_hooked("NtSetInformationThread") ||
+        is_ntdll_export_hooked("NtReadVirtualMemory") ||
+        is_ntdll_export_hooked("NtWriteVirtualMemory")) {
+        error(XorStr("Ntdll export hook detected, don't tamper with the program."));
     }
 }
 
@@ -3245,8 +3299,6 @@ static void send_simple_http_response(HANDLE requestQueueHandle, PHTTP_REQUEST p
 void modify()
 {
     // anti-tamper loop hardened for reliability and reduced false positives -nigel
-    g_modify_alive.store(true, std::memory_order_release);
-    g_modify_started.store(true, std::memory_order_release);
     constexpr DWORD kLoopSleepMs = 250;
     constexpr int kSectionFailThreshold = 2;
     constexpr int kLockMemFailThreshold = 3;
@@ -3255,7 +3307,6 @@ void modify()
     constexpr int kModuleFailThreshold = 2;
     constexpr int kWritableTextFailThreshold = 2;
     constexpr int kAdvancedDebugFailThreshold = 2;
-    constexpr int kModuleIntegrityFailThreshold = 2;
     constexpr int kHeavyCheckInterval = 8; // ~2s at 250ms cadence -nigel
     int sectionFailures = 0;
     int lockMemFailures = 0;
@@ -3264,7 +3315,6 @@ void modify()
     int moduleFailures = 0;
     int writableTextFailures = 0;
     int advancedDebugFailures = 0;
-    int moduleIntegrityFailures = 0;
     int loopCounter = 0;
 
     auto fnCheckRemoteDebuggerPresent = LI_FN(CheckRemoteDebuggerPresent).get();
@@ -3277,7 +3327,6 @@ void modify()
 
     while (true)
     {
-        g_modify_tick.fetch_add(1, std::memory_order_relaxed);
         // runtime anti-debug/anti-hook check -nigel
         protection::init();
         const bool injectionCompat = allow_injection_compat();
@@ -3347,44 +3396,9 @@ void modify()
             advancedDebugFailures = 0;
         }
 
-        // heavier module integrity checks on a slower cadence -nigel
+        // heavier integrity pulse on a slower cadence -nigel
         if ((++loopCounter % kHeavyCheckInterval) == 0) {
-            auto fnGetModuleHandleW = LI_FN(GetModuleHandleW).get();
-            if (fnGetModuleHandleW) {
-                HMODULE ntdll = fnGetModuleHandleW(L"ntdll.dll");
-                HMODULE kernel32 = fnGetModuleHandleW(L"kernel32.dll");
-                HMODULE kernelbase = fnGetModuleHandleW(L"kernelbase.dll");
-
-                bool integrityFail = false;
-                if (ntdll && module_text_differs_from_disk(ntdll)) {
-                    integrityFail = true;
-                }
-                if (kernel32 && module_text_differs_from_disk(kernel32)) {
-                    integrityFail = true;
-                }
-                if (kernelbase && module_text_differs_from_disk(kernelbase)) {
-                    integrityFail = true;
-                }
-
-                if (ntdll && module_text_has_writable_pages(ntdll)) {
-                    integrityFail = true;
-                }
-                if (kernel32 && module_text_has_writable_pages(kernel32)) {
-                    integrityFail = true;
-                }
-                if (kernelbase && module_text_has_writable_pages(kernelbase)) {
-                    integrityFail = true;
-                }
-
-                if (integrityFail) {
-                    if (++moduleIntegrityFailures >= kModuleIntegrityFailThreshold) {
-                        error(XorStr("System module integrity check failed, don't tamper with the program."));
-                    }
-                }
-                else {
-                    moduleIntegrityFailures = 0;
-                }
-            }
+            integrity_pulse_heavy();
         }
 
         if (Function_Address == 0) {
