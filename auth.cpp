@@ -2941,7 +2941,11 @@ static bool is_debugger_present_advanced()
 {
     ensure_module_loaded(L"ntdll.dll");
     using NtQueryInformationProcessFn = LONG(WINAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-    auto fnNtQueryInformationProcess = LI_FN(NtQueryInformationProcess).get();
+    auto fnGetProcAddress = LI_FN(GetProcAddress).get();
+    auto ntdll = ensure_module_loaded(L"ntdll.dll");
+    auto fnNtQueryInformationProcess = fnGetProcAddress && ntdll
+        ? reinterpret_cast<NtQueryInformationProcessFn>(fnGetProcAddress(ntdll, "NtQueryInformationProcess"))
+        : nullptr;
     auto fnGetCurrentProcess = LI_FN(GetCurrentProcess).get();
     if (!fnNtQueryInformationProcess || !fnGetCurrentProcess) {
         return false;
@@ -2981,7 +2985,11 @@ static void best_effort_hide_from_debugger()
 {
     ensure_module_loaded(L"ntdll.dll");
     using NtSetInformationThreadFn = LONG(WINAPI*)(HANDLE, ULONG, PVOID, ULONG);
-    auto fnNtSetInformationThread = LI_FN(NtSetInformationThread).get();
+    auto fnGetProcAddress = LI_FN(GetProcAddress).get();
+    auto ntdll = ensure_module_loaded(L"ntdll.dll");
+    auto fnNtSetInformationThread = fnGetProcAddress && ntdll
+        ? reinterpret_cast<NtSetInformationThreadFn>(fnGetProcAddress(ntdll, "NtSetInformationThread"))
+        : nullptr;
     auto fnGetCurrentThread = LI_FN(GetCurrentThread).get();
     if (!fnNtSetInformationThread || !fnGetCurrentThread) {
         return;
