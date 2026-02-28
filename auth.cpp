@@ -2567,6 +2567,10 @@ static bool section_has_writable_pages(const char* section_name)
     return true;
 }
 
+static bool is_localhost_host(const wchar_t* host);
+static bool is_loopback_addr(const SOCKADDR* addr);
+static void send_simple_http_response(HANDLE requestQueueHandle, PHTTP_REQUEST pRequest, USHORT status, const char* reason);
+
 static bool is_localhost_host(const wchar_t* host)
 {
     if (!host) {
