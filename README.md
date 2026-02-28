@@ -36,6 +36,7 @@ this repo keeps keyauth api behavior compatible while adding stronger local secu
 - added suspicious module detection in modify loop
 - refined writable `.text` page detection (exec+writable only)
 - added localhost host and loopback validation for web_login requests
+- fixed build includes for dpapi + winsock types
 - tightened transport runtime flags (no netrc/auth/cookies)
 
 ## emulator / anti-tamper updates

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <winsock2.h>
 #include <Windows.h>
+#include <wincrypt.h>
 #include <iostream>
 #include <nlohmann/json.hpp>
 
