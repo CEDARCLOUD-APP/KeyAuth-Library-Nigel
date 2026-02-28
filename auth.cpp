@@ -266,6 +266,26 @@ namespace {
     }
 
     // DPAPI encrypt on-disk seed content -nigel
+    // optional dynamic import wrapper to reduce static imports -nigel
+    bool crypt_protect_data_dynamic(DATA_BLOB* in, const wchar_t* desc, DATA_BLOB* optionalEntropy, void* reserved,
+        CRYPTPROTECT_PROMPTSTRUCT* prompt, DWORD flags, DATA_BLOB* out)
+    {
+#ifdef KEYAUTH_DYNAMIC_IMPORTS
+        static HMODULE crypt32 = LoadLibraryW(L"crypt32.dll");
+        if (!crypt32) {
+            return false;
+        }
+        using CryptProtectDataFn = BOOL(WINAPI*)(DATA_BLOB*, LPCWSTR, DATA_BLOB*, PVOID, CRYPTPROTECT_PROMPTSTRUCT*, DWORD, DATA_BLOB*);
+        auto fn = reinterpret_cast<CryptProtectDataFn>(GetProcAddress(crypt32, "CryptProtectData"));
+        if (!fn) {
+            return false;
+        }
+        return fn(in, desc, optionalEntropy, reserved, prompt, flags, out) != FALSE;
+#else
+        return CryptProtectData(in, desc, optionalEntropy, reserved, prompt, flags, out) != FALSE;
+#endif
+    }
+
     bool write_protected_seed_file(const std::string& filePath, const std::string& plaintext) {
         if (plaintext.empty()) {
             return false;
@@ -277,7 +297,7 @@ namespace {
         inputBlob.cbData = static_cast<DWORD>(plaintextBuffer.size());
 
         DATA_BLOB encryptedBlob{};
-        if (!CryptProtectData(&inputBlob, L"KeyAuthSeed", nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &encryptedBlob)) {
+        if (!crypt_protect_data_dynamic(&inputBlob, L"KeyAuthSeed", nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &encryptedBlob)) {
             return false;
         }
 
