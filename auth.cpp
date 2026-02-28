@@ -670,7 +670,8 @@ KeyAuth::api::Tfa& KeyAuth::api::disable2fa(std::string code)
     KeyAuth::api::activate = false;
 
     if (code.empty()) {
-        return this->tfa.handleInput(*this);
+        this->tfa.handleInput(*this);
+        return api::tfa;
     }
 
 
@@ -695,7 +696,7 @@ void KeyAuth::api::Tfa::QrCode() {
     qrcode.writeToPNG();
 }
 
-KeyAuth::api::Tfa& KeyAuth::api::Tfa::handleInput(KeyAuth::api& instance) {
+void KeyAuth::api::Tfa::handleInput(KeyAuth::api& instance) {
 
     if (instance.activate) {
         QrCode();
@@ -730,7 +731,7 @@ KeyAuth::api::Tfa& KeyAuth::api::Tfa::handleInput(KeyAuth::api& instance) {
 			instance.disable2fa(code);
 		}
 
-    return instance.tfa;
+    return;
 }
 
 void KeyAuth::api::web_login()

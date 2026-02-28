@@ -92,7 +92,7 @@ namespace KeyAuth {
 		public:
 			std::string secret;
 			std::string link;
-			Tfa& handleInput(KeyAuth::api& apiInstance);
+			void handleInput(KeyAuth::api& apiInstance);
 		private:
 			void QrCode();
 		};
