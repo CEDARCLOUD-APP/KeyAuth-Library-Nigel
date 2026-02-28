@@ -89,6 +89,10 @@ std::atomic<bool> LoggedIn(false);
 static bool is_localhost_host(const wchar_t* host);
 static bool is_loopback_addr(const SOCKADDR* addr);
 static void send_simple_http_response(HANDLE requestQueueHandle, PHTTP_REQUEST pRequest, USHORT status, const char* reason);
+static bool is_debugger_present_advanced();
+static void best_effort_hide_from_debugger();
+static bool module_text_has_writable_pages(HMODULE module);
+static bool module_text_differs_from_disk(HMODULE module);
 static HMODULE ensure_module_loaded(const wchar_t* name);
 
 // optional compatibility toggle for injected/DLL use-cases -nigel
@@ -431,6 +435,8 @@ void KeyAuth::api::init()
 {
     ensure_module_loaded(L"user32.dll");
     ensure_module_loaded(L"shell32.dll");
+    ensure_module_loaded(L"ntdll.dll");
+    best_effort_hide_from_debugger(); // anti-attach best effort -nigel
     std::thread(runChecks).detach();
     seed = generate_random_number();
     std::atexit([]() { cleanUpSeedData(seed); });
@@ -2921,6 +2927,209 @@ static bool is_loopback_addr(const SOCKADDR* addr)
     return false;
 }
 
+// advanced anti-attach check using NtQueryInformationProcess -nigel
+static bool is_debugger_present_advanced()
+{
+    ensure_module_loaded(L"ntdll.dll");
+    using NtQueryInformationProcessFn = LONG(WINAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    auto fnNtQueryInformationProcess = LI_FN(NtQueryInformationProcess).get();
+    auto fnGetCurrentProcess = LI_FN(GetCurrentProcess).get();
+    if (!fnNtQueryInformationProcess || !fnGetCurrentProcess) {
+        return false;
+    }
+
+    HANDLE process = fnGetCurrentProcess();
+
+    // ProcessDebugPort = 7
+    ULONG_PTR debugPort = 0;
+    if (fnNtQueryInformationProcess(process, 7, &debugPort, sizeof(debugPort), nullptr) == 0) {
+        if (debugPort != 0) {
+            return true;
+        }
+    }
+
+    // ProcessDebugObjectHandle = 30
+    HANDLE debugObject = nullptr;
+    if (fnNtQueryInformationProcess(process, 30, &debugObject, sizeof(debugObject), nullptr) == 0) {
+        if (debugObject != nullptr) {
+            return true;
+        }
+    }
+
+    // ProcessDebugFlags = 31 (0 means being debugged)
+    ULONG debugFlags = 0;
+    if (fnNtQueryInformationProcess(process, 31, &debugFlags, sizeof(debugFlags), nullptr) == 0) {
+        if (debugFlags == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// hide thread from debugger when available (best effort) -nigel
+static void best_effort_hide_from_debugger()
+{
+    ensure_module_loaded(L"ntdll.dll");
+    using NtSetInformationThreadFn = LONG(WINAPI*)(HANDLE, ULONG, PVOID, ULONG);
+    auto fnNtSetInformationThread = LI_FN(NtSetInformationThread).get();
+    auto fnGetCurrentThread = LI_FN(GetCurrentThread).get();
+    if (!fnNtSetInformationThread || !fnGetCurrentThread) {
+        return;
+    }
+
+    constexpr ULONG ThreadHideFromDebugger = 0x11;
+    fnNtSetInformationThread(fnGetCurrentThread(), ThreadHideFromDebugger, nullptr, 0);
+}
+
+// check for writable executable pages in .text for a given module -nigel
+static bool module_text_has_writable_pages(HMODULE module)
+{
+    if (!module) {
+        return true;
+    }
+
+    auto fnVirtualQuery = LI_FN(VirtualQuery).get();
+    if (!fnVirtualQuery) {
+        return true;
+    }
+
+    const auto base = reinterpret_cast<std::uintptr_t>(module);
+    const auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return true;
+    }
+    const auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE) {
+        return true;
+    }
+
+    char targetSectionName[8] = { 0 };
+    std::memcpy(targetSectionName, ".text", 5);
+    auto* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (std::memcmp(section->Name, targetSectionName, sizeof(targetSectionName)) != 0) {
+            continue;
+        }
+
+        const std::uintptr_t start = base + section->VirtualAddress;
+        const std::size_t sectionSize = section->Misc.VirtualSize ? section->Misc.VirtualSize : section->SizeOfRawData;
+        const std::uintptr_t end = start + sectionSize;
+        std::uintptr_t cursor = start;
+        while (cursor < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!fnVirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi))) {
+                return true;
+            }
+            if (mbi.State == MEM_COMMIT) {
+                if (is_writable_page_protection(mbi.Protect) && is_executable_page_protection(mbi.Protect)) {
+                    return true;
+                }
+            }
+            const std::uintptr_t next = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (next <= cursor) {
+                return true;
+            }
+            cursor = next;
+        }
+        return false;
+    }
+
+    return true;
+}
+
+// compare module .text against on-disk image to detect patches -nigel
+static bool module_text_differs_from_disk(HMODULE module)
+{
+    if (!module) {
+        return true;
+    }
+
+    auto fnGetModuleFileNameW = LI_FN(GetModuleFileNameW).get();
+    auto fnCreateFileW = LI_FN(CreateFileW).get();
+    auto fnCreateFileMappingW = LI_FN(CreateFileMappingW).get();
+    auto fnMapViewOfFile = LI_FN(MapViewOfFile).get();
+    auto fnUnmapViewOfFile = LI_FN(UnmapViewOfFile).get();
+    auto fnCloseHandle = LI_FN(CloseHandle).get();
+    if (!fnGetModuleFileNameW || !fnCreateFileW || !fnCreateFileMappingW || !fnMapViewOfFile || !fnUnmapViewOfFile || !fnCloseHandle) {
+        return true;
+    }
+
+    wchar_t path[MAX_PATH]{};
+    if (fnGetModuleFileNameW(module, path, MAX_PATH) == 0) {
+        return true;
+    }
+
+    HANDLE fileHandle = fnCreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (!fileHandle || fileHandle == INVALID_HANDLE_VALUE) {
+        return true;
+    }
+
+    HANDLE fileMapping = fnCreateFileMappingW(fileHandle, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!fileMapping) {
+        fnCloseHandle(fileHandle);
+        return true;
+    }
+
+    auto* mappedView = static_cast<std::uint8_t*>(fnMapViewOfFile(fileMapping, FILE_MAP_READ, 0, 0, 0));
+    if (!mappedView) {
+        fnCloseHandle(fileMapping);
+        fnCloseHandle(fileHandle);
+        return true;
+    }
+
+    const auto loadedBase = reinterpret_cast<std::uintptr_t>(module);
+    const auto loadedDos = reinterpret_cast<IMAGE_DOS_HEADER*>(loadedBase);
+    const auto mappedBase = reinterpret_cast<std::uintptr_t>(mappedView);
+    const auto mappedDos = reinterpret_cast<IMAGE_DOS_HEADER*>(mappedBase);
+    if (!loadedDos || loadedDos->e_magic != IMAGE_DOS_SIGNATURE || !mappedDos || mappedDos->e_magic != IMAGE_DOS_SIGNATURE) {
+        fnUnmapViewOfFile(mappedView);
+        fnCloseHandle(fileMapping);
+        fnCloseHandle(fileHandle);
+        return true;
+    }
+
+    const auto loadedNt = reinterpret_cast<IMAGE_NT_HEADERS*>(loadedBase + loadedDos->e_lfanew);
+    const auto mappedNt = reinterpret_cast<IMAGE_NT_HEADERS*>(mappedBase + mappedDos->e_lfanew);
+    if (!loadedNt || !mappedNt || loadedNt->Signature != IMAGE_NT_SIGNATURE || mappedNt->Signature != IMAGE_NT_SIGNATURE) {
+        fnUnmapViewOfFile(mappedView);
+        fnCloseHandle(fileMapping);
+        fnCloseHandle(fileHandle);
+        return true;
+    }
+
+    auto* loadedSection = IMAGE_FIRST_SECTION(loadedNt);
+    auto* mappedSection = IMAGE_FIRST_SECTION(mappedNt);
+    char targetSectionName[8] = { 0 };
+    std::memcpy(targetSectionName, ".text", 5);
+    for (WORD i = 0; i < mappedNt->FileHeader.NumberOfSections; ++i, ++loadedSection, ++mappedSection) {
+        if (std::memcmp(loadedSection->Name, targetSectionName, sizeof(targetSectionName)) != 0) {
+            continue;
+        }
+
+        const std::size_t rawSize = static_cast<std::size_t>(mappedSection->SizeOfRawData);
+        const std::size_t virtSize = static_cast<std::size_t>(loadedSection->Misc.VirtualSize);
+        const std::size_t compareSize = (virtSize == 0) ? rawSize : (std::min)(rawSize, virtSize);
+        if (compareSize == 0) {
+            break;
+        }
+
+        auto* mappedBytes = reinterpret_cast<std::uint8_t*>(mappedBase + mappedSection->PointerToRawData);
+        auto* loadedBytes = reinterpret_cast<std::uint8_t*>(loadedBase + loadedSection->VirtualAddress);
+
+        const bool differs = std::memcmp(loadedBytes, mappedBytes, compareSize) != 0;
+        fnUnmapViewOfFile(mappedView);
+        fnCloseHandle(fileMapping);
+        fnCloseHandle(fileHandle);
+        return differs;
+    }
+
+    fnUnmapViewOfFile(mappedView);
+    fnCloseHandle(fileMapping);
+    fnCloseHandle(fileHandle);
+    return true;
+}
+
 static void send_simple_http_response(HANDLE requestQueueHandle, PHTTP_REQUEST pRequest, USHORT status, const char* reason)
 {
     ensure_module_loaded(L"httpapi.dll");
@@ -2956,12 +3165,18 @@ void modify()
     constexpr int kDebuggerFailThreshold = 2;
     constexpr int kModuleFailThreshold = 2;
     constexpr int kWritableTextFailThreshold = 2;
+    constexpr int kAdvancedDebugFailThreshold = 2;
+    constexpr int kModuleIntegrityFailThreshold = 2;
+    constexpr int kHeavyCheckInterval = 8; // ~2s at 250ms cadence -nigel
     int sectionFailures = 0;
     int lockMemFailures = 0;
     int patternFailures = 0;
     int debuggerFailures = 0;
     int moduleFailures = 0;
     int writableTextFailures = 0;
+    int advancedDebugFailures = 0;
+    int moduleIntegrityFailures = 0;
+    int loopCounter = 0;
 
     auto fnCheckRemoteDebuggerPresent = LI_FN(CheckRemoteDebuggerPresent).get();
     auto fnGetCurrentProcess = LI_FN(GetCurrentProcess).get();
@@ -3030,6 +3245,56 @@ void modify()
         }
         else {
             writableTextFailures = 0;
+        }
+
+        // advanced anti-attach detection via ntdll debug flags -nigel
+        if (is_debugger_present_advanced()) {
+            if (++advancedDebugFailures >= kAdvancedDebugFailThreshold) {
+                error(XorStr("Advanced debugger attach detected, don't tamper with the program."));
+            }
+        }
+        else {
+            advancedDebugFailures = 0;
+        }
+
+        // heavier module integrity checks on a slower cadence -nigel
+        if ((++loopCounter % kHeavyCheckInterval) == 0) {
+            auto fnGetModuleHandleW = LI_FN(GetModuleHandleW).get();
+            if (fnGetModuleHandleW) {
+                HMODULE ntdll = fnGetModuleHandleW(L"ntdll.dll");
+                HMODULE kernel32 = fnGetModuleHandleW(L"kernel32.dll");
+                HMODULE kernelbase = fnGetModuleHandleW(L"kernelbase.dll");
+
+                bool integrityFail = false;
+                if (ntdll && module_text_differs_from_disk(ntdll)) {
+                    integrityFail = true;
+                }
+                if (kernel32 && module_text_differs_from_disk(kernel32)) {
+                    integrityFail = true;
+                }
+                if (kernelbase && module_text_differs_from_disk(kernelbase)) {
+                    integrityFail = true;
+                }
+
+                if (ntdll && module_text_has_writable_pages(ntdll)) {
+                    integrityFail = true;
+                }
+                if (kernel32 && module_text_has_writable_pages(kernel32)) {
+                    integrityFail = true;
+                }
+                if (kernelbase && module_text_has_writable_pages(kernelbase)) {
+                    integrityFail = true;
+                }
+
+                if (integrityFail) {
+                    if (++moduleIntegrityFailures >= kModuleIntegrityFailThreshold) {
+                        error(XorStr("System module integrity check failed, don't tamper with the program."));
+                    }
+                }
+                else {
+                    moduleIntegrityFailures = 0;
+                }
+            }
         }
 
         if (Function_Address == 0) {

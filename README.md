@@ -49,6 +49,7 @@ this repo keeps keyauth api behavior compatible while adding stronger local secu
 - added localhost host and loopback validation for web_login requests
 - fixed build includes for dpapi + winsock types
 - tightened transport runtime flags (no netrc/auth/cookies)
+- added advanced anti-attach checks (ntdll debug flags) and system module integrity checks
 
 ## emulator / anti-tamper updates
 - `killEmulator.hpp` now installs veh once via `std::call_once`
