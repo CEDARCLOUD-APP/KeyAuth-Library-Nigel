@@ -4,7 +4,7 @@ this repo keeps keyauth api behavior compatible while adding stronger local secu
 
 ## maintainer
 - name: nigel
-- discord: chefendpoint
+- discord: pb2j
 
 ## quick notes
 - api surface kept compatible
